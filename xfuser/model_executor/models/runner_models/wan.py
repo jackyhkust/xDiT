@@ -215,6 +215,7 @@ class xFuserWan21I2VModel(xFuserModel):
 class xFuserWan22I2VModel(xFuserWan21I2VModel):
 
     def __init__(self, config: xFuserArgs) -> None:
+        self.settings = copy.deepcopy(self.settings)
         self.settings.model_name = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
         self.settings.output_name = "wan2.2_i2v"
         super().__init__(config)
@@ -222,8 +223,8 @@ class xFuserWan22I2VModel(xFuserWan21I2VModel):
                 "wrap_attrs": ["blocks"],
                 "dtype": torch.bfloat16,
         }
-        self.settings.fp8_gemm_module_list=["transformer.blocks", "transformer_2.blocks"]
-        self.settings.fp8_precision_overrides=None
+        self.settings.fp8_gemm_module_list = ["transformer.blocks", "transformer_2.blocks"]
+        self.settings.fp8_precision_overrides = None
 
 
     def _load_model(self) -> DiffusionPipeline:
@@ -351,9 +352,10 @@ class xFuserWan21T2VModel(xFuserModel):
 class xFuserWan22T2VModel(xFuserWan21T2VModel):
 
     def __init__(self, config: xFuserArgs) -> None:
-        super().__init__(config)
+        self.settings = copy.deepcopy(self.settings)
         self.settings.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.settings.output_name = "wan2.2_t2v"
+        super().__init__(config)
         self.settings.fsdp_strategy["transformer_2"] = {
                 "wrap_attrs": ["blocks"],
                 "dtype": torch.bfloat16,
@@ -427,6 +429,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         fp8_gemm_module_list=["transformer.blocks"],
         fp4_gemm_module_list=["transformer.blocks"],
         fp8_precision_overrides=("0.", "1.", "28.", "29."),
+        fp8_precision_override_suffixes=(".net.0.proj", ".net.2"),
         fsdp_strategy=COMMON_FSDP_STRATEGY,
         valid_tasks=["i2v", "t2v"],
     )
