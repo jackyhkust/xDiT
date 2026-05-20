@@ -626,7 +626,9 @@ class xFuserModel(abc.ABC):
                 wrap_attrs = strategy.get("wrap_attrs", [])
                 dtype = strategy.get("dtype", None)
                 quantize_fn = self._build_fsdp_quantize_fn(component_name, wrap_attrs, fs_local_rank)
-                reshard_after_forward = self.config.reshard_after_forward
+                reshard_after_forward = getattr(
+                    self.config, "reshard_after_forward", True
+                )
                 fsdp_object = shard_component(
                     component, wrap_attrs, device_group, fs_local_rank, dtype,
                     quantize_fn=quantize_fn,
@@ -651,6 +653,9 @@ class xFuserModel(abc.ABC):
         fp8_precision_overrides entries like "5." apply to block index 5. We strip
         the block-index prefix before passing to the quantize functions so they see
         the same local FQN paths they would in the non-FSDP path.
+
+        Suffix patterns (e.g. .net.0.proj) are block-local FQNs and are passed
+        through unchanged on every block; only prefix patterns are stripped.
         """
         if not (self.config.use_fp4_gemms or self.config.use_fp8_gemms):
             return None
