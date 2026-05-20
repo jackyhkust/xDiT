@@ -215,10 +215,9 @@ class xFuserWan21I2VModel(xFuserModel):
 class xFuserWan22I2VModel(xFuserWan21I2VModel):
 
     def __init__(self, config: xFuserArgs) -> None:
-        self.settings = copy.deepcopy(self.settings)
+        super().__init__(config)
         self.settings.model_name = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
         self.settings.output_name = "wan2.2_i2v"
-        super().__init__(config)
         self.settings.fsdp_strategy["transformer_2"] = {
                 "wrap_attrs": ["blocks"],
                 "dtype": torch.bfloat16,
@@ -352,10 +351,9 @@ class xFuserWan21T2VModel(xFuserModel):
 class xFuserWan22T2VModel(xFuserWan21T2VModel):
 
     def __init__(self, config: xFuserArgs) -> None:
-        self.settings = copy.deepcopy(self.settings)
+        super().__init__(config)
         self.settings.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.settings.output_name = "wan2.2_t2v"
-        super().__init__(config)
         self.settings.fsdp_strategy["transformer_2"] = {
                 "wrap_attrs": ["blocks"],
                 "dtype": torch.bfloat16,

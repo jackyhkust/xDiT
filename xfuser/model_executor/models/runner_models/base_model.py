@@ -219,6 +219,7 @@ class xFuserModel(abc.ABC):
     fps: int = 0
 
     def __init__(self, config: xFuserArgs) -> None:
+        self.settings = copy.deepcopy(self.settings)
         self._validate_config(config)
         self._update_model_settings(config)
         self.config = config
