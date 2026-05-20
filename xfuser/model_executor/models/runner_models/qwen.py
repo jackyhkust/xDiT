@@ -1,5 +1,4 @@
 import torch
-import copy
 from diffusers import QwenImageEditPipeline, QwenImagePipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from xfuser.model_executor.models.runner_models.base_model import (
@@ -46,7 +45,6 @@ class xFuserQwenImageEditModel(xFuserModel):
 
     def __init__(self, config: xFuserArgs) -> None:
         super().__init__(config)
-        self.settings = copy.deepcopy(self.settings)
         if "2511" in config.model:
             self.settings.model_name = "Qwen/Qwen-Image-Edit-2511"
             self.settings.output_name = "qwen_image_edit_2511"
@@ -120,7 +118,6 @@ class xFuserQwenImageModel(xFuserModel):
 
     def __init__(self, config: xFuserArgs) -> None:
         super().__init__(config)
-        self.settings = copy.deepcopy(self.settings)
         if "2512" in config.model:
             self.settings.model_name = "Qwen/Qwen-Image-2512"
             self.settings.output_name = "qwen_image_2512"
