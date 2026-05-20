@@ -136,6 +136,7 @@ class DefaultInputValues:
     max_sequence_length: Optional[int] = None
     num_hybrid_attn_high_precision_steps: Optional[int] = None
     num_hybrid_gemm_high_precision_steps: Optional[int] = None
+    ssta_tile_thw: Optional[Tuple[int, int, int]] = None
 
 @dataclass
 class ModelSettings:
@@ -219,8 +220,13 @@ class xFuserModel(abc.ABC):
 
     def __init__(self, config: xFuserArgs) -> None:
         self._validate_config(config)
+        self._update_model_settings(config)
         self.config = config
         self.pipe = None
+
+    def _update_model_settings(self, config: xFuserArgs) -> None:
+        if config.use_fp4_gemms:
+            self._apply_fp8_override_cli_from_config(config)
 
     def initialize(self, input_args: dict) -> None:
         """ Load the model pipeline """
@@ -554,8 +560,8 @@ class xFuserModel(abc.ABC):
             name += f"_{self.config.task}"
         return name
 
-    def _apply_fp8_override_cli_from_config(self) -> None:
-        """Apply optional CLI FP8 override patterns (per-slot) before quantization."""
+    def _apply_fp8_override_cli_from_config(self, config: xFuserArgs) -> None:
+        """Apply optional CLI FP8 override patterns (per-slot) into ModelSettings."""
 
         def _parse_csv_patterns(raw: Optional[str]) -> Optional[Tuple[str, ...]]:
             if raw is None or not raw.strip():
@@ -563,20 +569,17 @@ class xFuserModel(abc.ABC):
             patterns = tuple(p.strip() for p in raw.split(",") if p.strip())
             return patterns or None
 
-        if self.config.fp8_precision_override_prefix_patterns is not None:
+        if config.fp8_precision_override_prefix_patterns is not None:
             self.settings.fp8_precision_overrides = _parse_csv_patterns(
-                self.config.fp8_precision_override_prefix_patterns
+                config.fp8_precision_override_prefix_patterns
             )
-        if self.config.fp8_precision_override_suffix_patterns is not None:
+        if config.fp8_precision_override_suffix_patterns is not None:
             self.settings.fp8_precision_override_suffixes = _parse_csv_patterns(
-                self.config.fp8_precision_override_suffix_patterns
+                config.fp8_precision_override_suffix_patterns
             )
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None: ##TODO: should this be renamed?
         """ Hook for any post model-load and state initialization """
-
-        if self.config.use_fp4_gemms:
-            self._apply_fp8_override_cli_from_config()
 
         local_rank = get_world_group().local_rank
         # FSDP path handles device placement and quantization (per-block for FSDP2).
@@ -670,6 +673,18 @@ class xFuserModel(abc.ABC):
 
         if not use_fp4_here and not use_fp8_here:
             return None
+
+        if use_fp4_here:
+            if fp8_overrides:
+                log(
+                    "The following blocks will be quantized to FP8, to maintain output quality: "
+                    f"{fp8_overrides} (prefix match)"
+                )
+            if fp8_suffix_overrides:
+                log(
+                    "The following layers will be quantized to FP8 via suffix match: "
+                    f"{fp8_suffix_overrides}"
+                )
 
         def quantize_fn(block, block_idx: int) -> None:
             block_prefix = f"{block_idx}."

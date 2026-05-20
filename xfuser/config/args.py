@@ -596,15 +596,13 @@ class xFuserArgs:
             "--fp8_precision_override_prefix_patterns",
             type=nullable_str,
             default=None,
-            help="Comma-delimited FQN prefix patterns to keep in FP8 during FP4 GEMMs "
-                 "(replaces model default prefix overrides when set).",
+            help="Comma-delimited FQN prefix patterns to keep in FP8 during FP4 GEMMs.",
         )
         parser.add_argument(
             "--fp8_precision_override_suffix_patterns",
             type=nullable_str,
             default=None,
-            help="Comma-delimited FQN suffix patterns to keep in FP8 during FP4 GEMMs "
-                 "(replaces model default suffix overrides when set).",
+            help="Comma-delimited FQN suffix patterns to keep in FP8 during FP4 GEMMs.",
         )
 
         parser.add_argument(
