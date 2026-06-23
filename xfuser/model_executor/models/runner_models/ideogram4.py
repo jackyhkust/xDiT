@@ -283,18 +283,42 @@ class xFuserIdeogram4Model(xFuserModel):
         if text_encoder is not None:
             load_kwargs["text_encoder"] = text_encoder
 
+        # Load prompt enhancer head for automatic JSON caption conversion
+        try:
+            from diffusers.pipelines.ideogram4.prompt_enhancer import (
+                Ideogram4PromptEnhancerHead,
+            )
+            prompt_enhancer_head = Ideogram4PromptEnhancerHead.from_pretrained(
+                "diffusers/qwen3-vl-8b-instruct-lm-head",
+                torch_dtype=torch.bfloat16,
+            )
+            load_kwargs["prompt_enhancer_head"] = prompt_enhancer_head
+            log("Loaded prompt enhancer head for automatic JSON caption conversion")
+        except Exception as e:
+            log(f"Prompt enhancer head not available ({e}), plain text prompts may produce poor results")
+
         xFuserPipeline = get_ideogram4_pipeline_class()
         pipe = xFuserPipeline.from_pretrained(**load_kwargs)
         return pipe
 
+    def _is_json_prompt(self, prompt):
+        if not isinstance(prompt, str):
+            return False
+        stripped = prompt.strip()
+        return stripped.startswith("{") and stripped.endswith("}")
+
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
+        prompt = input_args["prompt"]
+        use_upsampling = not self._is_json_prompt(prompt) and hasattr(self.pipe, "prompt_enhancer_head") and self.pipe.prompt_enhancer_head is not None
+
         output = self.pipe(
-            prompt=input_args["prompt"],
+            prompt=prompt,
             height=input_args["height"],
             width=input_args["width"],
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             guidance_schedule=None,
+            prompt_upsampling=use_upsampling,
             generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
             output_type="pil",
         )
