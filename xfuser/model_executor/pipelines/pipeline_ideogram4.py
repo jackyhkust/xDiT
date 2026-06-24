@@ -46,6 +46,18 @@ def _make_xfuser_ideogram4_pipeline_class():
 
         @torch.no_grad()
         def __call__(self, *args, **kwargs):
+            # Upsample prompt before CFG split so all ranks use the same caption
+            if kwargs.get("prompt_upsampling", False):
+                prompt = kwargs.get("prompt") or (args[0] if args else None)
+                height = kwargs.get("height", 2048)
+                width = kwargs.get("width", 2048)
+                prompt = self.upsample_prompt(prompt, height=height, width=width, device=self._execution_device)
+                if args:
+                    args = (prompt,) + args[1:]
+                else:
+                    kwargs["prompt"] = prompt
+                kwargs["prompt_upsampling"] = False
+
             try:
                 cfg_rank = get_classifier_free_guidance_rank()
                 cfg_world_size = get_classifier_free_guidance_world_size()
@@ -73,7 +85,6 @@ def _make_xfuser_ideogram4_pipeline_class():
             guidance_schedule=(7.0,) * 45 + (3.0,) * 3,
             mu=0.0,
             std=1.5,
-            prompt_upsampling=False,
             max_sequence_length=2048,
             num_images_per_prompt=1,
             generator=None,
@@ -84,9 +95,6 @@ def _make_xfuser_ideogram4_pipeline_class():
             cfg_rank=0,
             **kwargs,
         ):
-            if prompt_upsampling:
-                prompt = self.upsample_prompt(prompt, height=height, width=width, device=self._execution_device)
-
             self.check_inputs(
                 prompt=prompt, height=height, width=width,
                 num_inference_steps=num_inference_steps,
