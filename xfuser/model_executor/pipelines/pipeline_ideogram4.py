@@ -46,12 +46,27 @@ def _make_xfuser_ideogram4_pipeline_class():
 
         @torch.no_grad()
         def __call__(self, *args, **kwargs):
-            # Upsample prompt before CFG split so all ranks use the same caption
+            # Upsample prompt on rank 0 and broadcast so all ranks use the same caption
             if kwargs.get("prompt_upsampling", False):
-                prompt = kwargs.get("prompt") or (args[0] if args else None)
-                height = kwargs.get("height", 2048)
-                width = kwargs.get("width", 2048)
-                prompt = self.upsample_prompt(prompt, height=height, width=width, device=self._execution_device)
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+                if rank == 0:
+                    prompt = kwargs.get("prompt") or (args[0] if args else None)
+                    height = kwargs.get("height", 2048)
+                    width = kwargs.get("width", 2048)
+                    prompt = self.upsample_prompt(prompt, height=height, width=width, device=self._execution_device)
+                    if isinstance(prompt, list):
+                        prompt = prompt[0]
+                else:
+                    prompt = None
+
+                if world_size > 1:
+                    prompt_list = [prompt]
+                    dist.broadcast_object_list(prompt_list, src=0)
+                    prompt = prompt_list[0]
+
                 if args:
                     args = (prompt,) + args[1:]
                 else:
