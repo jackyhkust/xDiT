@@ -88,6 +88,29 @@ def _load_fp8_state_dict(model, state_dict, device, dtype):
     model.to(device)
 
 
+def _dequantize_fp8_state_dict(state_dict, dtype=torch.bfloat16):
+    """Dequantize FP8 weight+scale pairs into standard dtype tensors.
+
+    Converts `key.weight` (float8) + `key.weight_scale` (float32) pairs
+    into a single `key.weight` tensor in the target dtype, and drops
+    the scale keys. Non-FP8 tensors are cast to dtype as-is.
+    """
+    result = {}
+    scale_keys = {k for k in state_dict if k.endswith(FP8_SCALE_SUFFIX)}
+    for key, tensor in state_dict.items():
+        if key in scale_keys:
+            continue
+        scale_key = key + "_scale"
+        if tensor.dtype == FP8_WEIGHT_DTYPE and scale_key in state_dict:
+            scale = state_dict[scale_key].to(torch.float32)
+            result[key] = (tensor.to(torch.float32) * scale.unsqueeze(-1)).to(dtype)
+        elif tensor.is_floating_point():
+            result[key] = tensor.to(dtype)
+        else:
+            result[key] = tensor
+    return result
+
+
 def _load_sharded_safetensors(repo_id, subfolder, basename="diffusion_pytorch_model"):
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
@@ -229,25 +252,30 @@ class xFuserIdeogram4Model(xFuserModel):
         model._install_xfuser_processors()
         state_dict = _load_sharded_safetensors(model_id, subfolder)
         state_dict = _convert_ideogram_to_diffusers_keys(state_dict)
-        model.to(torch.bfloat16)
-        _swap_linears_to_fp8(model, state_dict, compute_dtype=torch.bfloat16)
-        _load_fp8_state_dict(model, state_dict, device=device, dtype=torch.bfloat16)
+        # Dequantize FP8 weights to BF16 nn.Linear so torchao/AITER
+        # quantization can operate on standard Linear layers.
+        state_dict = _dequantize_fp8_state_dict(state_dict, dtype=torch.bfloat16)
+        model.to(device=device, dtype=torch.bfloat16)
+        model.load_state_dict(state_dict, strict=False, assign=True)
         model.eval()
-        log(f"Loaded FP8 transformer from {model_id}/{subfolder}")
+        log(f"Loaded FP8 transformer (dequantized to BF16) from {model_id}/{subfolder}")
         return model
 
     def _load_fp8_text_encoder(self, model_id, device):
-        """Load FP8 text encoder using custom weight-only FP8 path."""
+        """Load FP8 text encoder, dequantizing to BF16."""
         from transformers import AutoConfig, AutoModel
         config = AutoConfig.from_pretrained(
             model_id, subfolder="text_encoder", trust_remote_code=True
         )
         model = AutoModel.from_config(config, trust_remote_code=True)
         state_dict = _load_sharded_safetensors(model_id, "text_encoder", basename="model")
-        _swap_linears_to_fp8(model, state_dict, compute_dtype=torch.bfloat16)
-        _load_fp8_state_dict(model, state_dict, device=device, dtype=torch.bfloat16)
+        state_dict = _dequantize_fp8_state_dict(state_dict, dtype=torch.bfloat16)
+        model.to(device=device, dtype=torch.bfloat16)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+        if unexpected:
+            log(f"Warning: unexpected keys in text encoder: {unexpected[:5]}")
         model.eval()
-        log(f"Loaded FP8 text encoder from {model_id}/text_encoder")
+        log(f"Loaded FP8 text encoder (dequantized to BF16) from {model_id}/text_encoder")
         return model
 
     def _load_model(self) -> DiffusionPipeline:
@@ -335,18 +363,6 @@ class xFuserIdeogram4Model(xFuserModel):
         self._run_timed_pipe(compile_args)
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
-        # FP8 transformers are already on device; skip the pipe.to() for them
-        has_fp8 = any(isinstance(m, Fp8Linear)
-                      for m in self.pipe.transformer.modules())
-        if has_fp8:
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            device = f"cuda:{local_rank}"
-            for name, component in self.pipe.components.items():
-                if name in ("transformer", "unconditional_transformer"):
-                    continue
-                if component is not None and hasattr(component, "to"):
-                    component.to(device)
-        else:
-            super()._post_load_and_state_initialization(input_args)
+        super()._post_load_and_state_initialization(input_args)
         if self.config.use_parallel_vae:
             _setup_parallel_vae(self.pipe.vae)
