@@ -19,6 +19,25 @@ def _rotate_half(x):
 class xFuserIdeogram4AttnProcessor:
     def __init__(self):
         self._num_text_tokens = 0
+        self._sp_size = 1
+        self._ulysses_size = 1
+        self._ulysses_rank = 0
+
+    def init_sp_state(self):
+        try:
+            self._sp_size = get_sequence_parallel_world_size()
+        except AssertionError:
+            self._sp_size = 1
+        try:
+            from xfuser.core.distributed import (
+                get_ulysses_parallel_world_size,
+                get_ulysses_parallel_rank,
+            )
+            self._ulysses_size = get_ulysses_parallel_world_size()
+            self._ulysses_rank = get_ulysses_parallel_rank()
+        except (AssertionError, ImportError):
+            self._ulysses_size = 1
+            self._ulysses_rank = 0
 
     def __call__(
         self,
@@ -40,20 +59,13 @@ class xFuserIdeogram4AttnProcessor:
         query = (query * cos) + (_rotate_half(query) * sin)
         key = (key * cos) + (_rotate_half(key) * sin)
 
-        try:
-            sp_size = get_sequence_parallel_world_size()
-        except AssertionError:
-            sp_size = 1
+        sp_size = self._sp_size
 
         if sp_size > 1 and self._num_text_tokens > 0:
             n_text = self._num_text_tokens
             from xfuser.model_executor.layers.usp import (
                 _ft_c_input_all_to_all,
                 _ft_c_output_all_to_all,
-            )
-            from xfuser.core.distributed import (
-                get_ulysses_parallel_world_size,
-                get_ulysses_parallel_rank,
             )
 
             # Split text (replicated) and image (chunked) in (B, L, H, D)
@@ -70,14 +82,14 @@ class xFuserIdeogram4AttnProcessor:
             image_v = image_v.transpose(1, 2)
 
             # USP all-to-all on image only: split heads, gather sequence
-            ulysses_size = get_ulysses_parallel_world_size()
+            ulysses_size = self._ulysses_size
             if ulysses_size > 1:
                 image_q = _ft_c_input_all_to_all(image_q)
                 image_k = _ft_c_input_all_to_all(image_k)
                 image_v = _ft_c_input_all_to_all(image_v)
 
             # Slice text to match the H/P heads on this rank
-            ulysses_rank = get_ulysses_parallel_rank()
+            ulysses_rank = self._ulysses_rank
             heads_per_rank = text_k.shape[1] // ulysses_size
             text_q_local = text_q[:, heads_per_rank * ulysses_rank : heads_per_rank * (ulysses_rank + 1)].contiguous()
             text_k_local = text_k[:, heads_per_rank * ulysses_rank : heads_per_rank * (ulysses_rank + 1)].contiguous()
@@ -141,9 +153,24 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             model._install_xfuser_processors()
             return model
 
+        def _init_sp_state(self):
+            try:
+                self._sp_rank = get_sequence_parallel_rank()
+                self._sp_size = get_sequence_parallel_world_size()
+            except AssertionError:
+                self._sp_rank = 0
+                self._sp_size = 1
+            for layer in self.layers:
+                layer.attention.processor.init_sp_state()
+
         def _set_processor_text_tokens(self, num_text_tokens):
             for layer in self.layers:
                 layer.attention.processor._num_text_tokens = num_text_tokens
+
+        def _set_sequence_layout(self, num_pad_tokens, num_text_tokens, num_image_tokens):
+            self._num_pad_tokens = num_pad_tokens
+            self._num_text_tokens = num_text_tokens
+            self._num_image_tokens = num_image_tokens
 
         def _chunk_and_pad(self, x, sp_rank, sp_size, pad_amount, dim):
             if pad_amount > 0:
@@ -169,13 +196,10 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             attention_kwargs: dict | None = None,
             return_dict: bool = True,
         ):
-            try:
-                get_runtime_state().increment_step_counter()
-                sp_rank = get_sequence_parallel_rank()
-                sp_size = get_sequence_parallel_world_size()
-            except AssertionError:
-                sp_rank = 0
-                sp_size = 1
+            if not hasattr(self, '_sp_size'):
+                self._init_sp_state()
+            sp_rank = self._sp_rank
+            sp_size = self._sp_size
 
             if sp_size <= 1:
                 return Ideogram4Transformer2DModel.forward(
@@ -192,9 +216,15 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             # SP path: replicate text tokens, chunk only image tokens.
             batch_size, seq_len, in_channels = hidden_states.shape
 
-            num_image_tokens = (indicator[0] == OUTPUT_IMAGE_INDICATOR).sum().item()
-            num_text_tokens = (indicator[0] == LLM_TOKEN_INDICATOR).sum().item()
-            num_pad_tokens = seq_len - num_image_tokens - num_text_tokens
+            if not hasattr(self, '_num_image_tokens') or self._num_image_tokens == 0:
+                self._set_sequence_layout(
+                    num_pad_tokens=int((indicator[0] == 0).sum()),
+                    num_text_tokens=int((indicator[0] == LLM_TOKEN_INDICATOR).sum()),
+                    num_image_tokens=int((indicator[0] == OUTPUT_IMAGE_INDICATOR).sum()),
+                )
+            num_image_tokens = self._num_image_tokens
+            num_text_tokens = self._num_text_tokens
+            num_pad_tokens = self._num_pad_tokens
 
             text_start = num_pad_tokens
             image_start = num_pad_tokens + num_text_tokens
