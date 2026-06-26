@@ -122,10 +122,11 @@ class xFuserIdeogram4AttnProcessor:
             hidden_states = USP(query, key, value)
             hidden_states = hidden_states.transpose(1, 2)
         else:
-            from diffusers.models.attention_dispatch import dispatch_attention_fn
-            hidden_states = dispatch_attention_fn(
-                query, key, value, attn_mask=attention_mask,
-            )
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            hidden_states = USP(query, key, value)
+            hidden_states = hidden_states.transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
         return attn.to_out[0](hidden_states)
