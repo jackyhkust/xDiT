@@ -86,6 +86,16 @@ def _make_xfuser_ideogram4_pipeline_class():
             do_cfg_parallel = has_guidance and cfg_world_size == 2
 
             if not do_cfg_parallel:
+                # Pre-set sequence layout for torch.compile
+                height = kwargs.get("height", 2048)
+                width = kwargs.get("width", 2048)
+                max_seq = kwargs.get("max_sequence_length", 2048)
+                grid_h = height // (self.vae_scale_factor * self.patch_size)
+                grid_w = width // (self.vae_scale_factor * self.patch_size)
+                n_img = grid_h * grid_w
+                if hasattr(self.transformer, '_set_sequence_layout'):
+                    self.transformer._set_sequence_layout(max_seq, 0, n_img)
+                    self.unconditional_transformer._set_sequence_layout(0, 0, n_img)
                 return super().__call__(*args, **kwargs)
 
             return self._call_with_cfg_parallel(cfg_rank=cfg_rank, **kwargs)
@@ -149,6 +159,14 @@ def _make_xfuser_ideogram4_pipeline_class():
             neg_position_ids = position_ids[:, max_sequence_length:]
             neg_segment_ids = segment_ids[:, max_sequence_length:]
             neg_indicator = indicator[:, max_sequence_length:]
+
+            # Set sequence layout for torch.compile (avoids .item() graph breaks)
+            num_text = (indicator[0] == 3).sum().item()  # LLM_TOKEN_INDICATOR
+            num_pad = max_sequence_length - num_text
+            if hasattr(self.transformer, '_set_sequence_layout'):
+                self.transformer._set_sequence_layout(num_pad, num_text, num_image_tokens)
+            if hasattr(self.unconditional_transformer, '_set_sequence_layout'):
+                self.unconditional_transformer._set_sequence_layout(0, 0, num_image_tokens)
 
             schedule_mu = _resolution_aware_mu(height=height, width=width, base_mu=mu)
             sigmas = _logit_normal_sigmas(num_inference_steps, schedule_mu, std=std, device=device)

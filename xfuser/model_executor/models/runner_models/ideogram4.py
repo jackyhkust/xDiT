@@ -255,6 +255,7 @@ class xFuserIdeogram4Model(xFuserModel):
         # Dequantize FP8 weights to BF16 nn.Linear so torchao/AITER
         # quantization can operate on standard Linear layers.
         state_dict = _dequantize_fp8_state_dict(state_dict, dtype=torch.bfloat16)
+        state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
         model.to(device=device, dtype=torch.bfloat16)
         model.load_state_dict(state_dict, strict=False, assign=True)
         model.eval()
@@ -270,6 +271,7 @@ class xFuserIdeogram4Model(xFuserModel):
         model = AutoModel.from_config(config, trust_remote_code=True)
         state_dict = _load_sharded_safetensors(model_id, "text_encoder", basename="model")
         state_dict = _dequantize_fp8_state_dict(state_dict, dtype=torch.bfloat16)
+        state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
         model.to(device=device, dtype=torch.bfloat16)
         missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
         if unexpected:
