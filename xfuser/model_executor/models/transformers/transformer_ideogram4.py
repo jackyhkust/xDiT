@@ -16,28 +16,37 @@ def _rotate_half(x):
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
+def _fp8_attention(query, key, value):
+    """Per-tensor FP8 attention using AITER's flash_attn_fp8_pertensor_func.
+
+    Input/output in BHSD layout. Internally converts to BSHD for AITER.
+    """
+    import aiter
+    # BHSD -> BSHD for AITER
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    q_abs_max = query.abs().amax().clamp(min=1e-12)
+    k_abs_max = key.abs().amax().clamp(min=1e-12)
+    v_abs_max = value.abs().amax().clamp(min=1e-12)
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+    q_scale = (q_abs_max / FP8_MAX).float()
+    k_scale = (k_abs_max / FP8_MAX).float()
+    v_scale = (v_abs_max / FP8_MAX).float()
+    q_fp8 = (query / q_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    k_fp8 = (key / k_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    v_fp8 = (value / v_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    out = aiter.flash_attn_fp8_pertensor_func(
+        q_fp8, k_fp8, v_fp8,
+        q_scale.view(1), k_scale.view(1), v_scale.view(1),
+    )
+    # BSHD -> BHSD
+    return out.transpose(1, 2)
+
+
 class xFuserIdeogram4AttnProcessor:
     def __init__(self):
-        self._num_text_tokens = 0
-        self._sp_size = 1
-        self._ulysses_size = 1
-        self._ulysses_rank = 0
-
-    def init_sp_state(self):
-        try:
-            self._sp_size = get_sequence_parallel_world_size()
-        except AssertionError:
-            self._sp_size = 1
-        try:
-            from xfuser.core.distributed import (
-                get_ulysses_parallel_world_size,
-                get_ulysses_parallel_rank,
-            )
-            self._ulysses_size = get_ulysses_parallel_world_size()
-            self._ulysses_rank = get_ulysses_parallel_rank()
-        except (AssertionError, ImportError):
-            self._ulysses_size = 1
-            self._ulysses_rank = 0
+        self._use_fp8_attention = False
 
     def __call__(
         self,
@@ -59,74 +68,17 @@ class xFuserIdeogram4AttnProcessor:
         query = (query * cos) + (_rotate_half(query) * sin)
         key = (key * cos) + (_rotate_half(key) * sin)
 
-        sp_size = self._sp_size
+        # (B, L, H, D) -> (B, H, L, D)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
 
-        if sp_size > 1 and self._num_text_tokens > 0:
-            n_text = self._num_text_tokens
-            from xfuser.model_executor.layers.usp import (
-                _ft_c_input_all_to_all,
-                _ft_c_output_all_to_all,
-            )
-
-            # Split text (replicated) and image (chunked) in (B, L, H, D)
-            text_q, image_q = query[:, :n_text], query[:, n_text:]
-            text_k, image_k = key[:, :n_text], key[:, n_text:]
-            text_v, image_v = value[:, :n_text], value[:, n_text:]
-
-            # Transpose to (B, H, L, D)
-            text_q = text_q.transpose(1, 2)
-            text_k = text_k.transpose(1, 2)
-            text_v = text_v.transpose(1, 2)
-            image_q = image_q.transpose(1, 2)
-            image_k = image_k.transpose(1, 2)
-            image_v = image_v.transpose(1, 2)
-
-            # USP all-to-all on image only: split heads, gather sequence
-            ulysses_size = self._ulysses_size
-            if ulysses_size > 1:
-                image_q = _ft_c_input_all_to_all(image_q)
-                image_k = _ft_c_input_all_to_all(image_k)
-                image_v = _ft_c_input_all_to_all(image_v)
-
-            # Slice text to match the H/P heads on this rank
-            ulysses_rank = self._ulysses_rank
-            heads_per_rank = text_k.shape[1] // ulysses_size
-            text_q_local = text_q[:, heads_per_rank * ulysses_rank : heads_per_rank * (ulysses_rank + 1)].contiguous()
-            text_k_local = text_k[:, heads_per_rank * ulysses_rank : heads_per_rank * (ulysses_rank + 1)].contiguous()
-            text_v_local = text_v[:, heads_per_rank * ulysses_rank : heads_per_rank * (ulysses_rank + 1)].contiguous()
-
-            # Image attention: image_q x [text_kv + image_kv]
-            full_k = torch.cat([text_k_local, image_k], dim=2)
-            full_v = torch.cat([text_v_local, image_v], dim=2)
-            attn_fn = usp_attention
-            image_out = attn_fn(image_q, full_k, full_v)
-
-            # Text attention: text_q x [text_kv + image_kv]
-            text_out = attn_fn(text_q_local, full_k, full_v)
-
-            # Reverse USP all-to-all on image: gather heads, split sequence
-            if ulysses_size > 1:
-                image_out = _ft_c_output_all_to_all(image_out)
-
-            # Gather text heads back across SP ranks
-            if ulysses_size > 1:
-                text_out = get_sp_group().all_gather(text_out.contiguous(), dim=1)
-
-            hidden_states = torch.cat([text_out.transpose(1, 2), image_out.transpose(1, 2)], dim=1)
-
-        elif sp_size > 1:
-            # Image-only path (unconditional transformer)
-            query = query.transpose(1, 2)
-            key = key.transpose(1, 2)
-            value = value.transpose(1, 2)
-            hidden_states = USP(query, key, value)
-            hidden_states = hidden_states.transpose(1, 2)
+        if self._use_fp8_attention:
+            hidden_states = _fp8_attention(query, key, value)
         else:
-            query = query.transpose(1, 2)
-            key = key.transpose(1, 2)
-            value = value.transpose(1, 2)
             hidden_states = USP(query, key, value)
-            hidden_states = hidden_states.transpose(1, 2)
+
+        hidden_states = hidden_states.transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
         return attn.to_out[0](hidden_states)
@@ -154,6 +106,10 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             model._install_xfuser_processors()
             return model
 
+        def _enable_fp8_attention(self):
+            for layer in self.layers:
+                layer.attention.processor._use_fp8_attention = True
+
         def _init_sp_state(self):
             try:
                 self._sp_rank = get_sequence_parallel_rank()
@@ -161,12 +117,6 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             except AssertionError:
                 self._sp_rank = 0
                 self._sp_size = 1
-            for layer in self.layers:
-                layer.attention.processor.init_sp_state()
-
-        def _set_processor_text_tokens(self, num_text_tokens):
-            for layer in self.layers:
-                layer.attention.processor._num_text_tokens = num_text_tokens
 
         def _set_sequence_layout(self, num_pad_tokens, num_text_tokens, num_image_tokens):
             self._num_pad_tokens = num_pad_tokens
@@ -253,28 +203,25 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             text_hidden_proj = text_enc_proj + text_emb
             image_hidden_proj = image_hidden + image_emb
 
-            # Chunk ONLY image tokens (always power-of-2 for standard resolutions)
-            img_pad_amount = (sp_size - (num_image_tokens % sp_size)) % sp_size
-            image_hidden_proj = self._chunk_and_pad(image_hidden_proj, sp_rank, sp_size, img_pad_amount, dim=1)
+            # Build tight [text | image] sequence (no padding)
+            full_hidden = torch.cat([text_hidden_proj, image_hidden_proj], dim=1)
+            full_len = num_text_tokens + num_image_tokens
 
-            # Position IDs: replicate text, chunk image
             text_pos = position_ids[:, text_start:image_start]
             image_pos = position_ids[:, image_start:]
-            image_pos = self._chunk_and_pad(image_pos, sp_rank, sp_size, img_pad_amount, dim=1)
+            full_pos = torch.cat([text_pos, image_pos], dim=1)
 
-            # Concatenate: [text_replicated | image_chunk]
-            hidden_states = torch.cat([text_hidden_proj, image_hidden_proj], dim=1)
-            pos_ids = torch.cat([text_pos, image_pos], dim=1)
+            # Chunk the ENTIRE sequence across SP ranks (like FLUX.2)
+            img_pad_amount = (sp_size - (full_len % sp_size)) % sp_size
+            hidden_states = self._chunk_and_pad(full_hidden, sp_rank, sp_size, img_pad_amount, dim=1)
+            pos_ids = self._chunk_and_pad(full_pos, sp_rank, sp_size, img_pad_amount, dim=1)
 
             cos, sin = self.rotary_emb(pos_ids)
             cos = cos.to(hidden_states.dtype)
             sin = sin.to(hidden_states.dtype)
             image_rotary_emb = (cos, sin)
 
-            # Tell attn processor where text ends
-            self._set_processor_text_tokens(num_text_tokens)
-
-            # Dummy mask (unused by USP path, used by non-SP fallback)
+            # Dummy mask (unused by USP path)
             local_seq_len = hidden_states.shape[1]
             attention_mask = torch.ones(
                 batch_size, 1, local_seq_len, local_seq_len,
@@ -291,19 +238,15 @@ def _make_xfuser_ideogram4_transformer_wrapper():
 
             output = self.final_layer(hidden_states, conditioning=adaln_input)
 
-            self._set_processor_text_tokens(0)
+            # Gather full sequence back
+            output = self._gather_and_unpad(output, img_pad_amount, dim=1)
 
-            # Split text and image output, gather image
-            text_output = output[:, :num_text_tokens]
-            image_output = output[:, num_text_tokens:]
-            image_output = self._gather_and_unpad(image_output, img_pad_amount, dim=1)
-
-            # Reconstruct [pad | text | image]
+            # Reconstruct [pad | text+image]
             pad_output = torch.zeros(
                 batch_size, num_pad_tokens, output.shape[-1],
                 dtype=output.dtype, device=output.device,
             )
-            output = torch.cat([pad_output, text_output, image_output], dim=1)
+            output = torch.cat([pad_output, output], dim=1)
 
             if not return_dict:
                 return (output,)

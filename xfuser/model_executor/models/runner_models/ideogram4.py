@@ -355,6 +355,54 @@ class xFuserIdeogram4Model(xFuserModel):
         return DiffusionOutput(images=output.images, pipe_args=input_args)
 
     def _compile_model(self, input_args: dict) -> None:
+        # Pre-upsample prompt before compile so all warmup/timed runs use
+        # the same caption length, preventing recompilation from shape changes.
+        prompt = input_args["prompt"]
+        if not self._is_json_prompt(prompt) and hasattr(self.pipe, "prompt_enhancer_head") and self.pipe.prompt_enhancer_head is not None:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            if rank == 0:
+                caption = self.pipe.upsample_prompt(
+                    prompt, height=input_args["height"], width=input_args["width"],
+                    device=self.pipe._execution_device,
+                )
+                if isinstance(caption, list):
+                    caption = caption[0]
+            else:
+                caption = None
+            if world_size > 1:
+                caption_list = [caption]
+                dist.broadcast_object_list(caption_list, src=0)
+                caption = caption_list[0]
+            input_args["prompt"] = caption
+            log(f"Pre-upsampled prompt for compile ({len(caption)} chars)")
+
+        # Pre-set sequence layout before compile to avoid .item() graph breaks.
+        # The conditional transformer sees [pad|text|image], the unconditional
+        # sees [image] only. Compute the actual text token count from the
+        # upsampled prompt to get the right layout.
+        height = input_args["height"]
+        width = input_args["width"]
+        grid_h = height // (self.pipe.vae_scale_factor * self.pipe.patch_size)
+        grid_w = width // (self.pipe.vae_scale_factor * self.pipe.patch_size)
+        num_image_tokens = grid_h * grid_w
+        max_seq = 2048  # default max_sequence_length
+
+        prompt = input_args["prompt"]
+        if hasattr(self.pipe, 'tokenizer') and prompt:
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            text = self.pipe.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            num_text = len(self.pipe.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0])
+        else:
+            num_text = 50
+        num_pad = max_seq - num_text
+
+        if hasattr(self.pipe.transformer, '_set_sequence_layout'):
+            self.pipe.transformer._set_sequence_layout(num_pad, num_text, num_image_tokens)
+        if hasattr(self.pipe.unconditional_transformer, '_set_sequence_layout'):
+            self.pipe.unconditional_transformer._set_sequence_layout(0, 0, num_image_tokens)
+
         torch._inductor.config.reorder_for_compute_comm_overlap = True
         self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default")
         self.pipe.unconditional_transformer = torch.compile(
@@ -368,3 +416,12 @@ class xFuserIdeogram4Model(xFuserModel):
         super()._post_load_and_state_initialization(input_args)
         if self.config.use_parallel_vae:
             _setup_parallel_vae(self.pipe.vae)
+        # Enable FP8 attention if requested via --attention_backend AITER_FP8
+        attn_backend = getattr(self.config, "attention_backend", None)
+        if attn_backend and "fp8" in str(attn_backend).lower():
+            if hasattr(self.pipe.transformer, '_enable_fp8_attention'):
+                self.pipe.transformer._enable_fp8_attention()
+                log("FP8 attention enabled for conditional transformer")
+            if hasattr(self.pipe.unconditional_transformer, '_enable_fp8_attention'):
+                self.pipe.unconditional_transformer._enable_fp8_attention()
+                log("FP8 attention enabled for unconditional transformer")
