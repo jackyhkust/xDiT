@@ -108,9 +108,26 @@ class xFuserIdeogram4AttnProcessor:
             if ulysses_size > 1:
                 image_out = _ft_c_output_all_to_all(image_out)
 
-            # Gather text heads back across SP ranks
+            # Gather text heads back across the Ulysses sub-group only.
+            #
+            # text_out is (B, num_heads // ulysses_size, n_text, D): the text
+            # heads were sliced by ulysses_rank above, and attn_fn here is the
+            # plain attention() (no ring reduction), so every ring rank holds an
+            # identical copy of text_out. Gathering over the *full* sequence-
+            # parallel group (get_sp_group(), size ulysses_size * ring_size)
+            # therefore yields (num_heads // ulysses_size) * (ulysses_size *
+            # ring_size) = num_heads * ring_size text heads, which mismatches the
+            # num_heads image stream in the cat below (e.g. 18*2 = 36 vs 18 for
+            # ulysses=2, ring=2). Gather over the Ulysses group to restore exactly
+            # num_heads, in ulysses-rank order matching the slice.
             if ulysses_size > 1:
-                text_out = get_sp_group().all_gather(text_out.contiguous(), dim=1)
+                import torch.distributed._functional_collectives as ft_c
+                from yunchang.globals import PROCESS_GROUP
+                from xfuser.model_executor.layers.usp import _maybe_wait
+                text_out = ft_c.all_gather_tensor(
+                    text_out.contiguous(), gather_dim=1, group=PROCESS_GROUP.ULYSSES_PG
+                )
+                text_out = _maybe_wait(text_out)
 
             hidden_states = torch.cat([text_out.transpose(1, 2), image_out.transpose(1, 2)], dim=1)
 
