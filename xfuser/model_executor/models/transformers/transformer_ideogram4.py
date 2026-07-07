@@ -2,10 +2,16 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
-from xfuser.model_executor.layers.usp import USP, attention as usp_attention
+from xfuser.model_executor.layers.usp import (
+    USP,
+    attention as usp_attention,
+    _ft_c_input_all_to_all,
+    _ft_c_output_all_to_all,
+)
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
+    get_ulysses_parallel_world_size,
     get_sp_group,
     get_runtime_state,
 )
@@ -74,7 +80,23 @@ class xFuserIdeogram4AttnProcessor:
         value = value.transpose(1, 2)
 
         if self._use_fp8_attention:
-            hidden_states = _fp8_attention(query, key, value)
+            # The AITER FP8 attention kernel is NOT sequence-parallel aware: it
+            # attends only over the tokens local to this rank. Under Ulysses SP
+            # the sequence is chunked across ranks, so without an all-to-all the
+            # rank(s) holding only image tokens never attend to the text tokens
+            # (which live on rank 0), and their image region denoises
+            # unconditionally -> the output splits into unrelated scenes.
+            # Mirror the Ulysses all-to-all that USP() performs: gather the full
+            # sequence while scattering heads, run local FP8 attention over the
+            # full sequence, then scatter the sequence back.
+            if get_ulysses_parallel_world_size() > 1:
+                query = _ft_c_input_all_to_all(query)
+                key = _ft_c_input_all_to_all(key)
+                value = _ft_c_input_all_to_all(value)
+                hidden_states = _fp8_attention(query, key, value)
+                hidden_states = _ft_c_output_all_to_all(hidden_states)
+            else:
+                hidden_states = _fp8_attention(query, key, value)
         else:
             hidden_states = USP(query, key, value)
 

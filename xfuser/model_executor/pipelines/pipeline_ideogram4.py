@@ -46,13 +46,30 @@ def _make_xfuser_ideogram4_pipeline_class():
 
         @torch.no_grad()
         def __call__(self, *args, **kwargs):
-            # Upsample prompt on rank 0 and broadcast so all ranks use the same caption
+            # Upsample the prompt on the local rank 0 of each sequence-parallel
+            # group and broadcast it WITHIN that SP group so every rank that
+            # shares a latent uses an identical caption.
+            #
+            # The broadcast is scoped to the SP group (not the world) on purpose:
+            # data-parallel groups each process a DIFFERENT prompt, so a world
+            # broadcast from global rank 0 would clobber every DP group's prompt
+            # with rank 0's caption (e.g. two DP ranks both rendering the "cat"
+            # prompt and dropping the "dog"). With SP-scoped broadcast, sp=1 DP
+            # ranks keep their own prompt, while ulysses/ring SP ranks (sp>1)
+            # still agree on one caption.
             if kwargs.get("prompt_upsampling", False):
                 import torch.distributed as dist
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                world_size = dist.get_world_size() if dist.is_initialized() else 1
+                from xfuser.core.distributed.parallel_state import get_sp_group
+                try:
+                    sp_group = get_sp_group()
+                    sp_local_rank = sp_group.rank_in_group
+                    sp_world_size = sp_group.world_size
+                except (AssertionError, RuntimeError):
+                    sp_group = None
+                    sp_local_rank = 0
+                    sp_world_size = 1
 
-                if rank == 0:
+                if sp_local_rank == 0:
                     prompt = kwargs.get("prompt") or (args[0] if args else None)
                     height = kwargs.get("height", 2048)
                     width = kwargs.get("width", 2048)
@@ -62,9 +79,14 @@ def _make_xfuser_ideogram4_pipeline_class():
                 else:
                     prompt = None
 
-                if world_size > 1:
+                # Broadcast within the SP group only (gloo cpu_group), from the
+                # group's first global rank. Scoping to SP (not world) lets each
+                # data-parallel group keep its own distinct prompt.
+                if sp_world_size > 1 and sp_group is not None:
                     prompt_list = [prompt]
-                    dist.broadcast_object_list(prompt_list, src=0)
+                    dist.broadcast_object_list(
+                        prompt_list, src=sp_group.first_rank, group=sp_group.cpu_group
+                    )
                     prompt = prompt_list[0]
 
                 if args:
