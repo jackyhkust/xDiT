@@ -214,11 +214,27 @@ class xFuserIdeogram4Model(xFuserModel):
         use_cfg_parallel=True,
         use_fp8_gemms=True,
         use_fp4_gemms=True,
+        use_hybrid_gemm_schedule=True,
         fully_shard_degree=True,
         use_parallel_vae=True,
         enable_tiling=True,
         enable_slicing=True,
     )
+
+    def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
+        # The per-step schedule is advanced once per transformer forward
+        # (see increment_step_counter in transformer_ideogram4). Ideogram4 runs a
+        # separate conditional and unconditional transformer, so the number of
+        # forwards per denoising step -- and therefore the schedule length -- depends
+        # on the classifier-free-guidance layout:
+        #   * guidance on, no CFG-parallel: one process runs both forwards -> 2
+        #   * CFG-parallel: the two forwards are split across ranks, one per rank -> 1
+        #   * no guidance: single forward -> 1
+        guidance_scale = input_args.get("guidance_scale")
+        do_cfg = guidance_scale is not None and guidance_scale > 1.0
+        if do_cfg and not self.config.use_cfg_parallel:
+            return 2
+        return 1
     default_input_values = DefaultInputValues(
         height=2048,
         width=2048,
