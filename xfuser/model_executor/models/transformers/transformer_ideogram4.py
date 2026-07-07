@@ -183,6 +183,14 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             sp_rank = self._sp_rank
             sp_size = self._sp_size
 
+            # Advance the per-step attention/GEMM schedule once per transformer
+            # forward. Ideogram4 was previously missing this call (unlike Wan et al.),
+            # so use_high_precision_gemm never left its initial True value and every
+            # hybrid layer stayed on the FP8 branch -- no MXFP4 GEMMs ever ran. Must
+            # run on both the SP<=1 fast path and the SP>1 path, so keep it above the
+            # branch below.
+            get_runtime_state().increment_step_counter()
+
             if sp_size <= 1:
                 return Ideogram4Transformer2DModel.forward(
                     self,
