@@ -1,6 +1,15 @@
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 from typing import Optional
+
+# Under CFG-parallel the pipeline re-stamps integer sequence-layout attributes
+# (_num_pad_tokens / _num_text_tokens) onto this module every __call__, and the
+# value changes per call (text length varies from the LLM encoder). torch.compile
+# treats nn.Module int attributes as static guards, so without this it recompiles
+# the whole forward every iteration (the ~25s step-1 stall seen in cfg+ulysses
+# runs). Unspecializing nn.Module ints keeps a single reused graph.
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 from xfuser.model_executor.layers.usp import (
     USP,
