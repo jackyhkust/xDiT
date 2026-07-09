@@ -11,16 +11,11 @@ from typing import Optional
 # runs). Unspecializing nn.Module ints keeps a single reused graph.
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
-from xfuser.model_executor.layers.usp import (
-    USP,
-    attention as usp_attention,
-    _ft_c_input_all_to_all,
-    _ft_c_output_all_to_all,
-)
+from xfuser.model_executor.layers.usp import USP
+from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
-    get_ulysses_parallel_world_size,
     get_sp_group,
     get_runtime_state,
 )
@@ -29,34 +24,6 @@ from xfuser.core.distributed import (
 def _rotate_half(x):
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
-def _fp8_attention(query, key, value):
-    """Per-tensor FP8 attention using AITER's flash_attn_fp8_pertensor_func.
-
-    Input/output in BHSD layout. Internally converts to BSHD for AITER.
-    """
-    import aiter
-    # BHSD -> BSHD for AITER
-    query = query.transpose(1, 2)
-    key = key.transpose(1, 2)
-    value = value.transpose(1, 2)
-    q_abs_max = query.abs().amax().clamp(min=1e-12)
-    k_abs_max = key.abs().amax().clamp(min=1e-12)
-    v_abs_max = value.abs().amax().clamp(min=1e-12)
-    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-    q_scale = (q_abs_max / FP8_MAX).float()
-    k_scale = (k_abs_max / FP8_MAX).float()
-    v_scale = (v_abs_max / FP8_MAX).float()
-    q_fp8 = (query / q_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    k_fp8 = (key / k_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    v_fp8 = (value / v_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    out = aiter.flash_attn_fp8_pertensor_func(
-        q_fp8, k_fp8, v_fp8,
-        q_scale.view(1), k_scale.view(1), v_scale.view(1),
-    )
-    # BSHD -> BHSD
-    return out.transpose(1, 2)
 
 
 class xFuserIdeogram4AttnProcessor:
@@ -88,26 +55,13 @@ class xFuserIdeogram4AttnProcessor:
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        if self._use_fp8_attention:
-            # The AITER FP8 attention kernel is NOT sequence-parallel aware: it
-            # attends only over the tokens local to this rank. Under Ulysses SP
-            # the sequence is chunked across ranks, so without an all-to-all the
-            # rank(s) holding only image tokens never attend to the text tokens
-            # (which live on rank 0), and their image region denoises
-            # unconditionally -> the output splits into unrelated scenes.
-            # Mirror the Ulysses all-to-all that USP() performs: gather the full
-            # sequence while scattering heads, run local FP8 attention over the
-            # full sequence, then scatter the sequence back.
-            if get_ulysses_parallel_world_size() > 1:
-                query = _ft_c_input_all_to_all(query)
-                key = _ft_c_input_all_to_all(key)
-                value = _ft_c_input_all_to_all(value)
-                hidden_states = _fp8_attention(query, key, value)
-                hidden_states = _ft_c_output_all_to_all(hidden_states)
-            else:
-                hidden_states = _fp8_attention(query, key, value)
-        else:
-            hidden_states = USP(query, key, value)
+        # Route through USP for both the default (BF16) and FP8 tensor-quant
+        # backends. USP() performs the Ulysses input/output all-to-all around the
+        # attention call, so FP8 attention correctly attends over the full
+        # sequence without any manual all-to-all wrapping here. The AITER FP8
+        # kernel itself is not sequence-parallel aware; USP handles that.
+        backend = AttentionBackendType.AITER_FP8_TQ if self._use_fp8_attention else None
+        hidden_states = USP(query, key, value, backend=backend)
 
         hidden_states = hidden_states.transpose(1, 2)
 
