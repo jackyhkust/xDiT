@@ -13,10 +13,13 @@ torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 from xfuser.model_executor.layers.usp import USP
 from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.model_executor.models.transformers.transformers_utils import (
+    chunk_and_pad_sequence,
+    gather_and_unpad,
+)
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
-    get_sp_group,
     get_runtime_state,
 )
 
@@ -108,19 +111,6 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             self._num_text_tokens = num_text_tokens
             self._num_image_tokens = num_image_tokens
 
-        def _chunk_and_pad(self, x, sp_rank, sp_size, pad_amount, dim):
-            if pad_amount > 0:
-                pad_shape = list(x.shape)
-                pad_shape[dim] = pad_amount
-                x = torch.cat([x, torch.zeros(pad_shape, dtype=x.dtype, device=x.device)], dim=dim)
-            return torch.chunk(x, sp_size, dim=dim)[sp_rank]
-
-        def _gather_and_unpad(self, x, pad_amount, dim):
-            x = get_sp_group().all_gather(x, dim=dim)
-            if pad_amount > 0:
-                x = x.narrow(dim=dim, start=0, length=x.size(dim) - pad_amount)
-            return x
-
         def forward(
             self,
             hidden_states: torch.Tensor,
@@ -206,8 +196,8 @@ def _make_xfuser_ideogram4_transformer_wrapper():
 
             # Chunk the ENTIRE sequence across SP ranks (like FLUX.2)
             img_pad_amount = (sp_size - (full_len % sp_size)) % sp_size
-            hidden_states = self._chunk_and_pad(full_hidden, sp_rank, sp_size, img_pad_amount, dim=1)
-            pos_ids = self._chunk_and_pad(full_pos, sp_rank, sp_size, img_pad_amount, dim=1)
+            hidden_states = chunk_and_pad_sequence(full_hidden, sp_rank, sp_size, img_pad_amount, dim=1)
+            pos_ids = chunk_and_pad_sequence(full_pos, sp_rank, sp_size, img_pad_amount, dim=1)
 
             cos, sin = self.rotary_emb(pos_ids)
             cos = cos.to(hidden_states.dtype)
@@ -230,7 +220,7 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             output = self.final_layer(hidden_states, conditioning=adaln_input)
 
             # Gather full sequence back
-            output = self._gather_and_unpad(output, img_pad_amount, dim=1)
+            output = gather_and_unpad(output, img_pad_amount, dim=1)
 
             # Reconstruct [pad | text+image]
             pad_output = torch.zeros(
