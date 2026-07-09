@@ -260,20 +260,18 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             sin = sin.to(hidden_states.dtype)
             image_rotary_emb = (cos, sin)
 
-            # Dummy mask (unused by USP path)
-            local_seq_len = hidden_states.shape[1]
-            attention_mask = torch.ones(
-                batch_size, 1, local_seq_len, local_seq_len,
-                dtype=torch.bool, device=hidden_states.device,
-            )
-
+            # No attention mask: the xFuser processor runs full-sequence
+            # attention via USP and ignores attention_mask, so the previous
+            # all-ones tensor was a no-op. Padding tokens are left unmasked;
+            # proper padding masking would need backend attn_mask support
+            # (see xdit-project/xDiT#733).
             for block in self.layers:
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
                     hidden_states = self._gradient_checkpointing_func(
-                        block, hidden_states, attention_mask, image_rotary_emb, adaln_input
+                        block, hidden_states, None, image_rotary_emb, adaln_input
                     )
                 else:
-                    hidden_states = block(hidden_states, attention_mask, image_rotary_emb, adaln_input)
+                    hidden_states = block(hidden_states, None, image_rotary_emb, adaln_input)
 
             output = self.final_layer(hidden_states, conditioning=adaln_input)
 
