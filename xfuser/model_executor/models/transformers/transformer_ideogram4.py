@@ -12,7 +12,6 @@ from typing import Optional
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 from xfuser.model_executor.layers.usp import USP
-from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
     gather_and_unpad,
@@ -30,9 +29,6 @@ def _rotate_half(x):
 
 
 class xFuserIdeogram4AttnProcessor:
-    def __init__(self):
-        self._use_fp8_attention = False
-
     def __call__(
         self,
         attn,
@@ -58,13 +54,11 @@ class xFuserIdeogram4AttnProcessor:
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        # Route through USP for both the default (BF16) and FP8 tensor-quant
-        # backends. USP() performs the Ulysses input/output all-to-all around the
-        # attention call, so FP8 attention correctly attends over the full
-        # sequence without any manual all-to-all wrapping here. The AITER FP8
-        # kernel itself is not sequence-parallel aware; USP handles that.
-        backend = AttentionBackendType.AITER_FP8_TQ if self._use_fp8_attention else None
-        hidden_states = USP(query, key, value, backend=backend)
+        # Route attention through USP, which performs the Ulysses input/output
+        # all-to-all around the attention call. The backend is whatever the user
+        # selected via --attention_backend (BF16 default, or AITER_FP8_TQ for the
+        # FP8 tensor-quant kernel); it is not overridden here.
+        hidden_states = USP(query, key, value)
 
         hidden_states = hidden_states.transpose(1, 2)
 
@@ -93,10 +87,6 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             model.__class__ = cls
             model._install_xfuser_processors()
             return model
-
-        def _enable_fp8_attention(self):
-            for layer in self.layers:
-                layer.attention.processor._use_fp8_attention = True
 
         def _init_sp_state(self):
             try:
@@ -204,11 +194,10 @@ def _make_xfuser_ideogram4_transformer_wrapper():
             sin = sin.to(hidden_states.dtype)
             image_rotary_emb = (cos, sin)
 
-            # No attention mask: the xFuser processor runs full-sequence
-            # attention via USP and ignores attention_mask, so the previous
-            # all-ones tensor was a no-op. Padding tokens are left unmasked;
-            # proper padding masking would need backend attn_mask support
-            # (see xdit-project/xDiT#733).
+            # No attention mask needed here. Diffusers' original mask is a
+            # block-diagonal segment mask whose only purpose is isolating packed
+            # batches; with padding already sliced away and a single [text|image]
+            # sample per sequence, every token legitimately attends to the rest.
             for block in self.layers:
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
                     hidden_states = self._gradient_checkpointing_func(

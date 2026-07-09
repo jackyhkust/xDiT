@@ -22,7 +22,6 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DefaultInputValues,
     DiffusionOutput,
 )
-from xfuser.core.distributed.parallel_state import get_vae_parallel_group
 from xfuser.core.utils.runner_utils import log
 
 
@@ -167,20 +166,6 @@ def _convert_ideogram_to_diffusers_keys(state_dict):
 # --- End FP8 loading ---
 
 
-def _setup_parallel_vae(vae):
-    try:
-        from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
-        patched_decoder = DecoderAdapter(
-            vae.decoder, vae_group=get_vae_parallel_group().device_group
-        ).to(vae.device)
-        vae.decoder = patched_decoder
-        log("Parallel VAE decoder enabled.")
-    except ImportError:
-        log("DistVAE not available for decoder. Defaulting to single-rank.")
-    except Exception as e:
-        raise ValueError(f"Failed to patch VAE decoder: {e}")
-
-
 def _detect_fp8_weights(model_id, subfolder="transformer"):
     from huggingface_hub import hf_hub_download
     try:
@@ -216,7 +201,6 @@ class xFuserIdeogram4Model(xFuserModel):
         use_fp4_gemms=True,
         use_hybrid_gemm_schedule=True,
         fully_shard_degree=True,
-        use_parallel_vae=True,
         enable_tiling=True,
         enable_slicing=True,
     )
@@ -430,14 +414,3 @@ class xFuserIdeogram4Model(xFuserModel):
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
         super()._post_load_and_state_initialization(input_args)
-        if self.config.use_parallel_vae:
-            _setup_parallel_vae(self.pipe.vae)
-        # Enable FP8 attention if requested via --attention_backend AITER_FP8
-        attn_backend = getattr(self.config, "attention_backend", None)
-        if attn_backend and "fp8" in str(attn_backend).lower():
-            if hasattr(self.pipe.transformer, '_enable_fp8_attention'):
-                self.pipe.transformer._enable_fp8_attention()
-                log("FP8 attention enabled for conditional transformer")
-            if hasattr(self.pipe.unconditional_transformer, '_enable_fp8_attention'):
-                self.pipe.unconditional_transformer._enable_fp8_attention()
-                log("FP8 attention enabled for unconditional transformer")
