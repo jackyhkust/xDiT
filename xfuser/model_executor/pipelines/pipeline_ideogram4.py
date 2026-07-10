@@ -79,9 +79,6 @@ def _make_xfuser_ideogram4_pipeline_class():
                 else:
                     prompt = None
 
-                # Broadcast within the SP group only (gloo cpu_group), from the
-                # group's first global rank. Scoping to SP (not world) lets each
-                # data-parallel group keep its own distinct prompt.
                 if sp_world_size > 1 and sp_group is not None:
                     prompt_list = [prompt]
                     dist.broadcast_object_list(
