@@ -1,11 +1,8 @@
 import copy
 import json
 import os
-import warnings
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
 from xfuser.model_executor.models.transformers.transformer_ideogram4 import (
@@ -32,60 +29,10 @@ FP8_WEIGHT_DTYPE = torch.float8_e4m3fn
 FP8_SCALE_SUFFIX = ".weight_scale"
 
 
-class Fp8Linear(nn.Module):
-    def __init__(self, in_features, out_features, bias, compute_dtype):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.compute_dtype = compute_dtype
-        self.register_buffer("weight", torch.empty(out_features, in_features, dtype=FP8_WEIGHT_DTYPE))
-        self.register_buffer("weight_scale", torch.empty(out_features, dtype=torch.float32))
-        if bias:
-            self.register_buffer("bias", torch.empty(out_features, dtype=compute_dtype))
-        else:
-            self.bias = None
-
-    def forward(self, x):
-        w = self.weight.to(x.dtype) * self.weight_scale.to(x.dtype).unsqueeze(1)
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w, bias)
-
-
 def _is_fp8_state_dict(state_dict):
     return any(k.endswith(FP8_SCALE_SUFFIX) for k in state_dict) or any(
         v.dtype == FP8_WEIGHT_DTYPE for v in state_dict.values()
     )
-
-
-def _swap_linears_to_fp8(module, state_dict, compute_dtype, prefix=""):
-    for name, child in list(module.named_children()):
-        child_prefix = f"{prefix}{name}"
-        if isinstance(child, nn.Linear) and f"{child_prefix}{FP8_SCALE_SUFFIX}" in state_dict:
-            setattr(module, name, Fp8Linear(
-                child.in_features, child.out_features,
-                bias=child.bias is not None, compute_dtype=compute_dtype,
-            ))
-        else:
-            _swap_linears_to_fp8(child, state_dict, compute_dtype, prefix=f"{child_prefix}.")
-
-
-def _load_fp8_state_dict(model, state_dict, device, dtype):
-    prepared = {}
-    for k, v in state_dict.items():
-        if v.dtype == FP8_WEIGHT_DTYPE:
-            prepared[k] = v.to(device=device)
-        elif k.endswith(FP8_SCALE_SUFFIX):
-            prepared[k] = v.to(device=device, dtype=torch.float32)
-        elif v.is_floating_point():
-            prepared[k] = v.to(device=device, dtype=dtype)
-        else:
-            prepared[k] = v.to(device=device)
-    missing, unexpected = model.load_state_dict(prepared, strict=False, assign=True)
-    if unexpected:
-        raise RuntimeError(f"Unexpected keys in FP8 state dict: {unexpected[:10]}")
-    if missing:
-        warnings.warn(f"Missing keys in FP8 state dict: {missing[:10]}")
-    model.to(device)
 
 
 def _dequantize_fp8_state_dict(state_dict, dtype=torch.bfloat16):
