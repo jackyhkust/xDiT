@@ -136,7 +136,8 @@ def _make_xfuser_ideogram4_transformer_wrapper():
                     return_dict=return_dict,
                 )
 
-            # SP path: replicate text tokens, chunk only image tokens.
+            # SP path: build a tight [text | image] sequence and chunk the whole
+            # thing across SP ranks (see below).
             batch_size, seq_len, in_channels = hidden_states.shape
 
             if not hasattr(self, '_num_image_tokens') or self._num_image_tokens == 0:
