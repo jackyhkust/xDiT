@@ -36,7 +36,9 @@ def _setup_aiter_environment_variables():
         AITER_SAGE_V2_BLOCK_R = _block_r if _block_r in [16, 32, 64, 128] else 128
     except (TypeError, ValueError):
         AITER_SAGE_V2_BLOCK_R = 128
-    return AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R
+    _aiter_fp8_use_hadamard = environment_variables["AITER_FP8_USE_HADAMARD"]()
+    AITER_FP8_USE_HADAMARD = str(_aiter_fp8_use_hadamard).strip().lower() not in ("0", "false", "no", "off")
+    return AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R, AITER_FP8_USE_HADAMARD
 
 def _check_aiter_round_mode():
     HOW_V3_BF16_CVT = None
@@ -360,7 +362,7 @@ if env_info["has_aiter"]:
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SPARSE_SAGE is not available.
 
-    AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
+    AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R, AITER_FP8_USE_HADAMARD = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
     AITER_FP8_HAS_DESCALE = _check_aiter_fp8_has_descale()
     AITER_SAGE_SUPPORTS_RING = _check_aiter_sage_supports_ring()
@@ -438,7 +440,6 @@ class AttentionBackendType(Enum):
     FLEX_BLOCK_ATTN = "Flex Block Attention"
     AITER = "AITER"
     AITER_FP8 = "AITER FP8"
-    AITER_FP8_TQ = "AITER FP8 (tensor-quant)"
     AITER_MLA = "AITER MLA"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
@@ -670,9 +671,11 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
     # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
-    R = FP8_HADAMARD_MATRIX[query.device]
-    query = _fp8_hadamard_rotate(query, R).contiguous()
-    key = _fp8_hadamard_rotate(key, R).contiguous()
+    # Opt out via XFUSER_AITER_FP8_HADAMARD=0 (reproduces the old un-rotated per-tensor path).
+    if AITER_FP8_USE_HADAMARD:
+        R = FP8_HADAMARD_MATRIX[query.device]
+        query = _fp8_hadamard_rotate(query, R).contiguous()
+        key = _fp8_hadamard_rotate(key, R).contiguous()
 
     softmax_lse = None
     quant_dtype = aiter.dtypes.fp8
@@ -715,39 +718,6 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     )
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
-
-@register_attention_function(AttentionBackendType.AITER_FP8_TQ)
-def _aiter_fp8_tq_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    """
-    AITER per-tensor-quant FP8 attention (used by Ideogram-4 at head-dim 256).
-
-    Manual per-tensor amax scaling followed by aiter.flash_attn_fp8_pertensor_func
-    with positional multiply-back scales. Follows the registry BHSD-in/out
-    convention; the Ulysses all-to-all is handled by USP(), so this only runs the
-    local FP8 kernel. Requires an aiter build shipping the head-dim-256 FP8 fmha
-    kernels (fmha_fwd_hd256_fp8_gfx950); older aiter errors here.
-    """
-    # BHSD -> BSHD for AITER
-    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
-    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
-    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
-
-    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-    q_scale = (query.abs().amax().clamp(min=1e-12) / FP8_MAX).float()
-    k_scale = (key.abs().amax().clamp(min=1e-12) / FP8_MAX).float()
-    v_scale = (value.abs().amax().clamp(min=1e-12) / FP8_MAX).float()
-    q_fp8 = (query / q_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    k_fp8 = (key / k_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    v_fp8 = (value / v_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-
-    output = aiter.flash_attn_fp8_pertensor_func(
-        q_fp8, k_fp8, v_fp8,
-        q_scale.view(1), k_scale.view(1), v_scale.view(1),
-        causal=is_causal,
-    )
-    # BSHD -> BHSD
-    output = torch.permute(output, [0, 2, 1, 3])
-    return output, None
 
 @register_attention_function(AttentionBackendType.AITER)
 def _aiter_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):

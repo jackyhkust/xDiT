@@ -19,7 +19,6 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DefaultInputValues,
     DiffusionOutput,
 )
-from xfuser.core.distributed.parallel_state import get_vae_parallel_group
 from xfuser.core.utils.runner_utils import log
 
 
@@ -63,21 +62,24 @@ def _load_sharded_safetensors(repo_id, subfolder, basename="diffusion_pytorch_mo
     from huggingface_hub.errors import EntryNotFoundError
     from safetensors.torch import load_file
     index_file = f"{subfolder}/{basename}.safetensors.index.json"
+    # Only the index download signals sharded-vs-single. Scope the fallback to
+    # that probe so a genuinely missing shard (below) surfaces instead of being
+    # masked as "not sharded".
     try:
         index_path = hf_hub_download(repo_id=repo_id, filename=index_file)
-        with open(index_path) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
-        shard_filenames = sorted(set(weight_map.values()))
-        state_dict = {}
-        for shard in shard_filenames:
-            shard_path = hf_hub_download(repo_id=repo_id, filename=f"{subfolder}/{shard}")
-            state_dict.update(load_file(shard_path))
-        return state_dict
     except EntryNotFoundError:
         single_file = f"{subfolder}/{basename}.safetensors"
         path = hf_hub_download(repo_id=repo_id, filename=single_file)
         return load_file(path)
+    with open(index_path) as f:
+        index = json.load(f)
+    weight_map = index["weight_map"]
+    shard_filenames = sorted(set(weight_map.values()))
+    state_dict = {}
+    for shard in shard_filenames:
+        shard_path = hf_hub_download(repo_id=repo_id, filename=f"{subfolder}/{shard}")
+        state_dict.update(load_file(shard_path))
+    return state_dict
 
 
 def _convert_ideogram_to_diffusers_keys(state_dict):
@@ -112,20 +114,6 @@ def _convert_ideogram_to_diffusers_keys(state_dict):
 
 
 # --- End FP8 loading ---
-
-
-def _setup_parallel_vae(vae):
-    try:
-        from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
-        patched_decoder = DecoderAdapter(
-            vae.decoder, vae_group=get_vae_parallel_group().device_group
-        ).to(vae.device)
-        vae.decoder = patched_decoder
-        log("Parallel VAE decoder enabled.")
-    except ImportError:
-        log("DistVAE not available for decoder. Defaulting to single-rank.")
-    except Exception as e:
-        raise ValueError(f"Failed to patch VAE decoder: {e}")
 
 
 def _detect_fp8_weights(model_id, subfolder="transformer"):
@@ -163,8 +151,8 @@ class xFuserIdeogram4Model(xFuserModel):
         use_fp4_gemms=True,
         use_hybrid_gemm_schedule=True,
         fully_shard_degree=True,
-        # NOTE: parallel VAE shows no measurable speedup at 2048^2 for this version.
-        use_parallel_vae=True,
+        # Parallel VAE intentionally omitted: A/B tested on 4-GPU 2048^2 (no
+        # measurable speedup) and the pipeline has no parallel-decode gather.
         enable_tiling=True,
         enable_slicing=True,
     )
@@ -375,8 +363,3 @@ class xFuserIdeogram4Model(xFuserModel):
         compile_args = copy.deepcopy(input_args)
         compile_args["num_inference_steps"] = 2
         self._run_timed_pipe(compile_args)
-
-    def _post_load_and_state_initialization(self, input_args: dict) -> None:
-        super()._post_load_and_state_initialization(input_args)
-        if self.config.use_parallel_vae:
-            _setup_parallel_vae(self.pipe.vae)

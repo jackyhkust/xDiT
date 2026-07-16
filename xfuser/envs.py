@@ -46,6 +46,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "AITER_FP8_STATIC_SCALE_WITH_DESCALE": lambda: os.environ.get(
                 "XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE", None
             ),
+    # Toggles the QK Hadamard rotation in the AITER_FP8 attention path (default on).
+    # Set XFUSER_AITER_FP8_HADAMARD=0 to reproduce the old un-rotated per-tensor path.
+    "AITER_FP8_USE_HADAMARD": lambda: os.environ.get("XFUSER_AITER_FP8_HADAMARD", "1"),
     "AITER_SAGE_V2_BLOCK_R": lambda: os.environ.get("XFUSER_AITER_SAGE_V2_BLOCK_R", "128"),
     "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),
 }

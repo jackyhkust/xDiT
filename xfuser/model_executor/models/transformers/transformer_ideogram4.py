@@ -55,8 +55,10 @@ class xFuserIdeogram4AttnProcessor:
 
         # Route attention through USP, which performs the Ulysses input/output
         # all-to-all around the attention call. The backend is whatever the user
-        # selected via --attention_backend (BF16 default, or AITER_FP8_TQ for the
-        # FP8 tensor-quant kernel); it is not overridden here.
+        # selected via --attention_backend (BF16 default, or aiter_fp8 for the
+        # FP8 per-tensor-quant kernel at head_dim 256); it is not overridden here.
+        # The aiter_fp8 path Hadamard-rotates Q/K by default; set
+        # XFUSER_AITER_FP8_HADAMARD=0 to disable (old un-rotated per-tensor path).
         hidden_states = USP(query, key, value)
 
         hidden_states = hidden_states.transpose(1, 2)
