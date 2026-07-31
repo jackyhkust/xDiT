@@ -36,7 +36,9 @@ def _setup_aiter_environment_variables():
         AITER_SAGE_V2_BLOCK_R = _block_r if _block_r in [16, 32, 64, 128] else 128
     except (TypeError, ValueError):
         AITER_SAGE_V2_BLOCK_R = 128
-    return AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R
+    _aiter_fp8_use_hadamard = environment_variables["AITER_FP8_USE_HADAMARD"]()
+    AITER_FP8_USE_HADAMARD = str(_aiter_fp8_use_hadamard).strip().lower() not in ("0", "false", "no", "off")
+    return AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R, AITER_FP8_USE_HADAMARD
 
 def _check_aiter_round_mode():
     HOW_V3_BF16_CVT = None
@@ -361,7 +363,7 @@ if env_info["has_aiter"]:
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SPARSE_SAGE is not available.
 
-    AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R = _setup_aiter_environment_variables()
+    AITER_FP8_STATIC_SCALE_WITH_DESCALE, AITER_FP8_STATIC_SCALE_NO_DESCALE, AITER_SAGE_V2_BLOCK_R, AITER_FP8_USE_HADAMARD = _setup_aiter_environment_variables()
     AITER_HAS_ROUND_MODE, HOW_V3_BF16_CVT = _check_aiter_round_mode()
     AITER_FP8_HAS_DESCALE = _check_aiter_fp8_has_descale()
     AITER_SAGE_SUPPORTS_RING = _check_aiter_sage_supports_ring()
@@ -725,9 +727,11 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
     # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
-    R = FP8_HADAMARD_MATRIX[query.device]
-    query = _fp8_hadamard_rotate(query, R).contiguous()
-    key = _fp8_hadamard_rotate(key, R).contiguous()
+    # Opt out via XFUSER_AITER_FP8_HADAMARD=0 (reproduces the old un-rotated per-tensor path).
+    if AITER_FP8_USE_HADAMARD:
+        R = FP8_HADAMARD_MATRIX[query.device]
+        query = _fp8_hadamard_rotate(query, R).contiguous()
+        key = _fp8_hadamard_rotate(key, R).contiguous()
 
     softmax_lse = None
     quant_dtype = aiter.dtypes.fp8
