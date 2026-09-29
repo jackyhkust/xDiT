@@ -167,6 +167,7 @@ class xFuserArgs:
     # Model arguments
     model: str = ""
     download_dir: Optional[str] = None
+    vdn_transformer_dir: Optional[str] = None
     trust_remote_code: bool = False
     # Runtime arguments
     warmup_steps: int = 1
@@ -452,6 +453,14 @@ class xFuserArgs:
             type=nullable_str,
             default=xFuserArgs.download_dir,
             help="Directory to download and load the weights, default to the default cache dir of huggingface.",
+        )
+        model_group.add_argument(
+            "--vdn_transformer_dir",
+            type=nullable_str,
+            default=xFuserArgs.vdn_transformer_dir,
+            help="Path to the materialized VDN-H3 transformer directory (must contain a "
+            "transformer/ subfolder). Overrides the VDN_H3_TRANSFORMER_DIR environment "
+            "variable. Required when --model is OpenVDN/vdn-minimax-h3 (or VDN-H3).",
         )
         model_group.add_argument(
             "--trust-remote-code",
@@ -806,6 +815,14 @@ class xFuserArgs:
             type=str,
             help="Name or path of the huggingface model to use.",
             required=True,
+        )
+        parser.add_argument(
+            "--vdn_transformer_dir",
+            type=nullable_str,
+            default=xFuserArgs.vdn_transformer_dir,
+            help="Path to the materialized VDN-H3 transformer directory (must contain a "
+            "transformer/ subfolder). Overrides the VDN_H3_TRANSFORMER_DIR environment "
+            "variable. Required when --model is OpenVDN/vdn-minimax-h3 (or VDN-H3).",
         )
         parser.add_argument(
             "--use_parallel_vae",

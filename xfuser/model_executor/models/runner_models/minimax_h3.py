@@ -848,12 +848,17 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
     def _vdn_transformer_dir(self) -> str:
         import os
 
-        directory = os.environ.get(VDN_H3_TRANSFORMER_DIR_ENV)
+        # Prefer the explicit CLI/config argument, then fall back to the env var
+        # for backward compatibility.
+        directory = getattr(self.config, "vdn_transformer_dir", None) or os.environ.get(
+            VDN_H3_TRANSFORMER_DIR_ENV
+        )
         if not directory:
             raise RuntimeError(
                 "VDN-H3 needs the materialized transformer dir. Run "
-                "tools/vdn_h3/materialize_vdn_transformer.py, then set "
-                f"${VDN_H3_TRANSFORMER_DIR_ENV} to its output directory."
+                "tools/vdn_h3/materialize_vdn_transformer.py, then pass "
+                "--vdn_transformer_dir <dir> (or set "
+                f"${VDN_H3_TRANSFORMER_DIR_ENV})."
             )
         if not os.path.isdir(os.path.join(directory, "transformer")):
             raise RuntimeError(
