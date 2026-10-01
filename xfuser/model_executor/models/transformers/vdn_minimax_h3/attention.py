@@ -27,6 +27,7 @@ by the transformer wrapper and stashed on ``attn._vdn_meta``.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -439,7 +440,10 @@ class VDNMiniMaxH3AttnProcessor:
         k_sm = k_sm[0]
         v_sm = v[0]
         softmax_gate = attn.softmax_gate(x) if attn.softmax_gate is not None else None
-        if meta.full_cover:
+        ablation = os.environ.get("VDN_ABLATION", "").strip().lower()
+        if ablation == "window_off":
+            window = torch.zeros_like(q_sm)
+        elif meta.full_cover:
             window = dense_softmax(
                 q_sm, k_sm, v_sm,
                 used=layout.used, scale=scale, softmax_gate=softmax_gate,
@@ -453,7 +457,7 @@ class VDNMiniMaxH3AttnProcessor:
         out = attn.to_out[0](window.reshape(layout.seq_len, heads * head_dim))
 
         # ---- linear (Video-Delta) branch on the video rows ----------------
-        if not meta.full_cover and layout.num_frames > 0:
+        if ablation != "linear_off" and not meta.full_cover and layout.num_frames > 0:
             branch = attn.linear_attention
             video = slice(layout.video_start, layout.video_end)
             text = slice(0, layout.text_len)
