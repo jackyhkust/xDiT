@@ -9,9 +9,10 @@ outside every mask; a per-(token, head) sigmoid gate scales the output.
 The window runs as a union of dense varlen attention calls: the dense-query rows
 against all keys, then per-chunk gathered ``[globals | window | anchors]`` K/V.
 This mirrors SGLang's ``hybrid_window_attn_h3`` decomposition. The varlen executor
-defaults to a per-segment SDPA (correct on ROCm and CUDA); set
-``VDN_WINDOW_BACKEND=aiter`` to try AITER's Triton varlen kernel with an SDPA
-fallback.
+defaults to a per-segment SDPA (correct on ROCm and CUDA). Set
+``VDN_WINDOW_BACKEND=aiter`` for AITER's Triton varlen bf16 kernel (SDPA
+fallback), or ``VDN_WINDOW_BACKEND=aiter_fp8`` for AITER per-tensor FP8 varlen
+(Hadamard-rotated Q/K, same kernel as ``--attention_backend AITER_FP8``).
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _WINDOW_BACKEND = os.environ.get("VDN_WINDOW_BACKEND", "sdpa").lower()
 _AITER_VARLEN = None  # resolved lazily; set to False after a failed import
+_AITER_FP8_VARLEN = None  # (kernel, rotate, hadamard) resolved lazily
+_AITER_FP8_LOGGED = False
 
 
 # --------------------------------------------------------------------------
@@ -315,6 +318,73 @@ def _sdpa_varlen(
     return out
 
 
+def _aiter_fp8_varlen_parts():
+    """Lazy import of the existing AITER FP8 varlen op and Q/K rotation helpers."""
+    global _AITER_FP8_VARLEN
+    if _AITER_FP8_VARLEN is None:
+        from xfuser.core.distributed.attention_backend import (
+            _aiter_fp8_varlen_attention_kernel,
+            _fp8_hadamard_rotate,
+            _get_fp8_hadamard_matrix,
+        )
+
+        _AITER_FP8_VARLEN = (
+            _aiter_fp8_varlen_attention_kernel,
+            _fp8_hadamard_rotate,
+            _get_fp8_hadamard_matrix,
+        )
+    return _AITER_FP8_VARLEN
+
+
+def _aiter_fp8_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    scale: float,
+) -> torch.Tensor:
+    """Per-tensor FP8 varlen attention. q [Tq, H, d], k/v [Tk, H, d] -> [Tq, H, d].
+
+    Q and K are Hadamard-rotated before quantization, matching
+    ``AttentionBackendType.AITER_FP8``. The quant + kernel live in the
+    ``xfuser::aiter_fp8_varlen_attention`` custom op, so torch.compile treats
+    them as one opaque node.
+    """
+    global _AITER_FP8_LOGGED
+    kernel, rotate, hadamard = _aiter_fp8_varlen_parts()
+    if not _AITER_FP8_LOGGED:
+        _AITER_FP8_LOGGED = True
+        rank0 = True
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank0 = torch.distributed.get_rank() == 0
+        if rank0:
+            logger.info(
+                "VDN-H3 window softmax: AITER FP8 varlen "
+                "(per-tensor, Hadamard-rotated Q/K)."
+            )
+    rotation = hadamard(q.shape[-1], q.device)
+    out = kernel(
+        rotate(q, rotation).contiguous(),
+        rotate(k, rotation).contiguous(),
+        v.contiguous(),
+        cu_q.to(device=q.device, dtype=torch.int32).contiguous(),
+        cu_k.to(device=k.device, dtype=torch.int32).contiguous(),
+        int(max_q),
+        int(max_k),
+        float(scale),
+        False,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+    if out.dtype != q.dtype:
+        out = out.to(dtype=q.dtype)
+    return out
+
+
 def _varlen(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -327,6 +397,10 @@ def _varlen(
     scale: float,
 ) -> torch.Tensor:
     global _WINDOW_BACKEND
+    if _WINDOW_BACKEND == "aiter_fp8":
+        return _aiter_fp8_varlen(
+            q, k, v, cu_q=cu_q, cu_k=cu_k, max_q=max_q, max_k=max_k, scale=scale,
+        )
     if _WINDOW_BACKEND == "aiter":
         try:
             out = _aiter_triton_varlen_func()(

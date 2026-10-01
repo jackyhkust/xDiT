@@ -822,8 +822,9 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
         height=768,
         width=1344,
         num_frames=124,
-        # stage-dmd-step-250 folds the 8-NFE DMD2 turbo distill.
-        num_inference_steps=8,
+        # stage-dmd-step-250 is the 8-NFE distill. MiniMaxH3Scheduler counts
+        # sigma grid points, so 9 points produce those 8 transformer forwards.
+        num_inference_steps=9,
     )
 
     settings = copy.deepcopy(xFuserMiniMaxH3Model.settings)
@@ -866,6 +867,15 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
                 "subfolder; point it at the materializer output directory."
             )
         return directory
+
+    def _validate_args(self, input_args: dict) -> None:
+        xFuserMiniMaxH3Model._validate_args(self, input_args)
+        if input_args["num_inference_steps"] != 9:
+            raise ValueError(
+                "VDN-H3 stage-dmd-step-250 is distilled for 9 scheduler points "
+                "(8 transformer forwards). "
+                f"Got num_inference_steps={input_args['num_inference_steps']}."
+            )
 
     def _load_model(self):
         from diffusers import ModularPipeline
