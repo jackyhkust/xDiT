@@ -59,6 +59,7 @@ from xfuser.model_executor.models.transformers.vdn_minimax_h3.window_softmax imp
     DecomposedPlan,
     build_layout,
     dense_softmax,
+    prepare_window_backend,
     windowed_softmax,
 )
 
@@ -126,6 +127,7 @@ def attach_vdn_modules(
     )
     attn._vdn_meta = None
     attn.set_processor(VDNMiniMaxH3AttnProcessor(hybrid))
+    prepare_window_backend()
 
 
 # --------------------------------------------------------------------------

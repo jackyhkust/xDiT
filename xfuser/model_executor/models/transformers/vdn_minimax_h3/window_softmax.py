@@ -11,7 +11,9 @@ against all keys, then per-chunk gathered ``[globals | window | anchors]`` K/V.
 This mirrors SGLang's ``hybrid_window_attn_h3`` decomposition. The varlen executor
 defaults to a per-segment SDPA (correct on ROCm and CUDA). Set
 ``VDN_WINDOW_BACKEND=aiter`` for AITER's Triton varlen bf16 kernel (SDPA
-fallback), or ``VDN_WINDOW_BACKEND=aiter_fp8`` for AITER per-tensor FP8 varlen
+fallback), ``VDN_WINDOW_BACKEND=aiter_ck`` for one AITER CK/ASM
+``flash_attn_varlen_func`` call per varlen group, or
+``VDN_WINDOW_BACKEND=aiter_fp8`` for AITER per-tensor FP8 varlen
 (Hadamard-rotated Q/K, same kernel as ``--attention_backend AITER_FP8``).
 """
 
@@ -37,6 +39,8 @@ _WINDOW_BACKEND = os.environ.get("VDN_WINDOW_BACKEND", "sdpa").lower()
 _AITER_VARLEN = None  # resolved lazily; set to False after a failed import
 _AITER_FP8_VARLEN = None  # (kernel, rotate, hadamard) resolved lazily
 _AITER_FP8_LOGGED = False
+_AITER_CK_OP = None
+_AITER_CK_LOGGED = False
 
 
 # --------------------------------------------------------------------------
@@ -276,6 +280,105 @@ class DecomposedPlan:
 # --------------------------------------------------------------------------
 
 
+def _ensure_aiter_ck_op():
+    """Register one opaque CK varlen op so torch.compile does not trace AITER.
+
+    Called at module attach, before ``transformer.forward`` is compiled.
+    """
+    global _AITER_CK_OP
+    if _AITER_CK_OP is not None:
+        return _AITER_CK_OP
+    import inspect
+
+    import aiter
+
+    params = inspect.signature(aiter.flash_attn_varlen_func).parameters
+    how_v3 = 2 if "how_v3_bf16_cvt" in params else None
+
+    def _vdn_aiter_ck_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+        kwargs = {
+            "dropout_p": 0.0,
+            "softmax_scale": float(scale),
+            "causal": False,
+            "return_lse": False,
+            "return_attn_probs": False,
+        }
+        if how_v3 is not None:
+            kwargs["how_v3_bf16_cvt"] = how_v3
+        out = aiter.flash_attn_varlen_func(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            cu_q.to(device=q.device, dtype=torch.int32).contiguous(),
+            cu_k.to(device=k.device, dtype=torch.int32).contiguous(),
+            max_seqlen_q=int(max_q),
+            max_seqlen_k=int(max_k),
+            **kwargs,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    def _vdn_aiter_ck_varlen_fake(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+        return torch.empty_like(q)
+
+    # This module uses postponed annotations. The op schema needs real types.
+    _annotations = {
+        "q": torch.Tensor,
+        "k": torch.Tensor,
+        "v": torch.Tensor,
+        "cu_q": torch.Tensor,
+        "cu_k": torch.Tensor,
+        "max_q": int,
+        "max_k": int,
+        "scale": float,
+        "return": torch.Tensor,
+    }
+    _vdn_aiter_ck_varlen.__annotations__ = _annotations
+    _vdn_aiter_ck_varlen_fake.__annotations__ = _annotations
+    op = torch.library.custom_op(
+        "xfuser::vdn_aiter_ck_varlen", mutates_args=()
+    )(_vdn_aiter_ck_varlen)
+    op.register_fake(_vdn_aiter_ck_varlen_fake)
+
+    _AITER_CK_OP = op
+    return _AITER_CK_OP
+
+
+def prepare_window_backend() -> None:
+    """Resolve ``VDN_WINDOW_BACKEND`` before the compiled forward runs."""
+    global _WINDOW_BACKEND, _AITER_CK_LOGGED
+    if _WINDOW_BACKEND == "ck":
+        _WINDOW_BACKEND = "aiter_ck"
+    if _WINDOW_BACKEND != "aiter_ck":
+        return
+    _ensure_aiter_ck_op()
+    if _AITER_CK_LOGGED:
+        return
+    _AITER_CK_LOGGED = True
+    rank0 = True
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank0 = torch.distributed.get_rank() == 0
+    if rank0:
+        logger.info(
+            "VDN-H3 window softmax: AITER CK varlen "
+            "(one flash_attn_varlen_func call per group)."
+        )
+
+
+def _aiter_ck_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    scale: float,
+) -> torch.Tensor:
+    op = _ensure_aiter_ck_op()
+    return op(q, k, v, cu_q, cu_k, int(max_q), int(max_k), float(scale))
+
+
 def _aiter_triton_varlen_func():
     global _AITER_VARLEN
     if _AITER_VARLEN is None:
@@ -399,6 +502,10 @@ def _varlen(
     global _WINDOW_BACKEND
     if _WINDOW_BACKEND == "aiter_fp8":
         return _aiter_fp8_varlen(
+            q, k, v, cu_q=cu_q, cu_k=cu_k, max_q=max_q, max_k=max_k, scale=scale,
+        )
+    if _WINDOW_BACKEND == "aiter_ck":
+        return _aiter_ck_varlen(
             q, k, v, cu_q=cu_q, cu_k=cu_k, max_q=max_q, max_k=max_k, scale=scale,
         )
     if _WINDOW_BACKEND == "aiter":
