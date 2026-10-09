@@ -44,6 +44,8 @@ def _padded_length(sequence_length: int) -> int:
 class xFuserMiniMaxH3VDNTransformer3DWrapper(xFuserMiniMaxH3Transformer3DWrapper):
     """MiniMax-H3 with VDN hybrid attention (window softmax + linear branch)."""
 
+    _rope_full_sequence = True
+
     def __init__(
         self,
         *,
@@ -100,9 +102,7 @@ class xFuserMiniMaxH3VDNTransformer3DWrapper(xFuserMiniMaxH3Transformer3DWrapper
         )
         self.register_to_config(hybrid_attention=hybrid_attention)
         self.hybrid = VDNHybridAttentionArchConfig.from_transform_config(
-            hybrid_attention["config"]
-            if "config" in hybrid_attention
-            else hybrid_attention
+            hybrid_attention["config"] if "config" in hybrid_attention else hybrid_attention
         )
         for block in self.transformer_blocks:
             attach_vdn_modules(
@@ -114,9 +114,7 @@ class xFuserMiniMaxH3VDNTransformer3DWrapper(xFuserMiniMaxH3Transformer3DWrapper
             )
         self._vdn_meta_key: tuple | None = None
         self._vdn_meta = None
-        self.register_forward_pre_hook(
-            type(self)._prime_vdn_meta_hook, with_kwargs=True
-        )
+        self.register_forward_pre_hook(type(self)._prime_vdn_meta_hook, with_kwargs=True)
 
     # ---- geometry priming ------------------------------------------------
 
@@ -185,8 +183,7 @@ def _bind_forward_layout(module, args, kwargs) -> dict[str, torch.Tensor]:
             bound[name] = kwargs[name]
         elif index < len(args):
             bound[name] = args[index]
-    missing = [n for n in ("position_ids", "video_indices", "audio_indices",
-                            "text_indices") if n not in bound]
+    missing = [n for n in ("position_ids", "video_indices", "audio_indices", "text_indices") if n not in bound]
     if missing:
         raise RuntimeError(f"VDN meta priming missing forward inputs: {missing}")
     return bound

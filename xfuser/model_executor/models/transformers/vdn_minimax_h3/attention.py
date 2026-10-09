@@ -92,11 +92,7 @@ def build_vdn_meta(
         seq_len=int(padded_length),
     )
     full_cover = hybrid.full_cover(layout.num_frames)
-    plan = (
-        None
-        if full_cover
-        else DecomposedPlan(layout, hybrid, position_ids.device)
-    )
+    plan = None if full_cover else DecomposedPlan(layout, hybrid, position_ids.device)
     return VDNRequestMeta(layout=layout, plan=plan, full_cover=full_cover)
 
 
@@ -117,14 +113,8 @@ def attach_vdn_modules(
         num_attention_heads=num_attention_heads,
         attention_head_dim=attention_head_dim,
     )
-    attn.softmax_gate = (
-        VDNSoftmaxGate(hidden_size, num_attention_heads)
-        if hybrid.enable_softmax_gate
-        else None
-    )
-    attn.to_out_linear = nn.Linear(
-        linear_channels, hidden_size, bias=False, dtype=_BF16
-    )
+    attn.softmax_gate = VDNSoftmaxGate(hidden_size, num_attention_heads) if hybrid.enable_softmax_gate else None
+    attn.to_out_linear = nn.Linear(linear_channels, hidden_size, bias=False, dtype=_BF16)
     attn._vdn_meta = None
     attn.set_processor(VDNMiniMaxH3AttnProcessor(hybrid))
     prepare_window_backend()
@@ -150,21 +140,20 @@ def _slice_alpha(alpha: VDNFrameAlpha, h0: int, h1: int, d: int) -> VDNFrameAlph
     local.head_dim = d
     local.down = alpha.down  # hidden -> head_dim, head-independent (shared)
     up = nn.Linear(
-        d, (h1 - h0) * d, bias=False,
-        dtype=alpha.up.weight.dtype, device=alpha.up.weight.device,
+        d,
+        (h1 - h0) * d,
+        bias=False,
+        dtype=alpha.up.weight.dtype,
+        device=alpha.up.weight.device,
     )
     up.weight = nn.Parameter(alpha.up.weight[h0 * d : h1 * d].clone(), requires_grad=False)
     local.up = up
     local.A_log = nn.Parameter(alpha.A_log[h0:h1].clone(), requires_grad=False)
-    local.dt_bias = nn.Parameter(
-        alpha.dt_bias[h0 * d : h1 * d].clone(), requires_grad=False
-    )
+    local.dt_bias = nn.Parameter(alpha.dt_bias[h0 * d : h1 * d].clone(), requires_grad=False)
     return local
 
 
-def _slice_short_conv(
-    sc: VDNShortConv | None, h0: int, h1: int, d: int
-) -> VDNShortConv | None:
+def _slice_short_conv(sc: VDNShortConv | None, h0: int, h1: int, d: int) -> VDNShortConv | None:
     if sc is None:
         return None
     local = VDNShortConv.__new__(VDNShortConv)
@@ -175,19 +164,19 @@ def _slice_short_conv(
         sp = getattr(sc, f"{name}_sp")["weight"][c0:c1].clone()
         tm = getattr(sc, f"{name}_tm")["weight"][c0:c1].clone()
         setattr(
-            local, f"{name}_sp",
+            local,
+            f"{name}_sp",
             nn.ParameterDict({"weight": nn.Parameter(sp, requires_grad=False)}),
         )
         setattr(
-            local, f"{name}_tm",
+            local,
+            f"{name}_tm",
             nn.ParameterDict({"weight": nn.Parameter(tm, requires_grad=False)}),
         )
     return local
 
 
-def _build_local_branch(
-    branch: MiniMaxH3VDNLinearBranch, h0: int, h1: int, d: int
-) -> MiniMaxH3VDNLinearBranch:
+def _build_local_branch(branch: MiniMaxH3VDNLinearBranch, h0: int, h1: int, d: int) -> MiniMaxH3VDNLinearBranch:
     """A branch whose forward runs on the rank's head slice [h0, h1)."""
     local = MiniMaxH3VDNLinearBranch.__new__(MiniMaxH3VDNLinearBranch)
     nn.Module.__init__(local)
@@ -245,18 +234,14 @@ class VDNMiniMaxH3AttnProcessor:
                 "transformer wrapper must set attn._vdn_meta before forward."
             )
         if hidden_states.shape[0] != 1:
-            raise NotImplementedError(
-                f"VDN-H3 port handles batch size 1, got {hidden_states.shape[0]}."
-            )
+            raise NotImplementedError(f"VDN-H3 port handles batch size 1, got {hidden_states.shape[0]}.")
 
         world = get_ulysses_parallel_world_size()
         if world <= 1:
             return self._compute(attn, hidden_states, rotary_emb, meta)
         return self._compute_ulysses(attn, hidden_states, rotary_emb, meta, world)
 
-    def _video_frame_mean(
-        self, x_local: torch.Tensor, rank: int, s_local: int, layout: "VDNH3Layout"
-    ) -> torch.Tensor:
+    def _video_frame_mean(self, x_local: torch.Tensor, rank: int, s_local: int, layout: "VDNH3Layout") -> torch.Tensor:
         """Per-frame mean of x over the video rows, reduced across the SP group.
 
         The frame mean is a reduction over the full hidden dim, so every rank needs
@@ -288,9 +273,10 @@ class VDNMiniMaxH3AttnProcessor:
     ) -> torch.Tensor:
         """Head-sharded Ulysses hybrid attention.
 
-        Each rank projects its sequence shard with ALL heads, applies RoPE and the
+        Each rank projects its sequence shard with ALL heads, computes the
         per-(token, head) gates locally, then all-to-alls the per-head tensors into
-        [full sequence, local heads]. Both branches run on the local head slice, so
+        [full sequence, local heads]; QK-norm and RoPE are applied after the
+        all-to-all. Both branches run on the local head slice, so
         the window softmax and the Video-Delta scan FLOPs are divided across ranks.
         The per-head outputs are all-to-all'd back to [local sequence, all heads] and
         the shared output projections finish on the sequence shard. ``frame_mean``
@@ -298,8 +284,9 @@ class VDNMiniMaxH3AttnProcessor:
         """
         layout = meta.layout
         heads = attn.heads
-        head_dim = attn.to_q.out_features // heads if not attn.fused_projections \
-            else attn.to_qkv.out_features // (3 * heads)
+        head_dim = (
+            attn.to_q.out_features // heads if not attn.fused_projections else attn.to_qkv.out_features // (3 * heads)
+        )
         scale = 1.0 / math.sqrt(head_dim)
         rank = get_ulysses_parallel_rank()
         h_local = heads // world
@@ -320,13 +307,6 @@ class VDNMiniMaxH3AttnProcessor:
         k = k.unflatten(-1, (heads, -1))
         v = v.unflatten(-1, (heads, -1))
 
-        # window branch q/k: norm + RoPE (rope is this rank's sequence slice) ---
-        q_sm = attn.norm_q(q)
-        k_sm = attn.norm_k(k)
-        if rotary_emb is not None:
-            q_sm = _apply_rotary_emb(q_sm, *rotary_emb)
-            k_sm = _apply_rotary_emb(k_sm, *rotary_emb)
-
         # per-(token, head) gates, computed with all heads on the shard ---------
         softmax_gate = attn.softmax_gate(x) if attn.softmax_gate is not None else None
         branch = attn.linear_attention
@@ -337,22 +317,38 @@ class VDNMiniMaxH3AttnProcessor:
             frame_mean = self._video_frame_mean(x, rank, s_local, layout)  # [F, C]
 
         # ---- scatter heads / gather sequence ---------------------------------
-        q_sm = _seq_to_head_a2a(q_sm[0])  # [S_full, H_local, d]
-        k_sm = _seq_to_head_a2a(k_sm[0])
+        # Raw q/k cross once and feed both branches. QK-norm is per head and RoPE
+        # per token, so the window branch applies them after the all-to-all;
+        # rotary_emb covers the full padded sequence (_rope_full_sequence).
+        q_raw = _seq_to_head_a2a(q[0])  # [S_full, H_local, d]
+        k_raw = _seq_to_head_a2a(k[0])
         v_sm = _seq_to_head_a2a(v[0])
+        q_sm = attn.norm_q(q_raw)
+        k_sm = attn.norm_k(k_raw)
+        if rotary_emb is not None:
+            q_sm = _apply_rotary_emb(q_sm.unsqueeze(0), *rotary_emb)[0]
+            k_sm = _apply_rotary_emb(k_sm.unsqueeze(0), *rotary_emb)[0]
         if softmax_gate is not None:
             softmax_gate = _seq_to_head_a2a(softmax_gate.unsqueeze(-1)).squeeze(-1)
 
         # ---- window (softmax) branch, local heads over the full sequence ------
         if meta.full_cover:
             window = dense_softmax(
-                q_sm, k_sm, v_sm,
-                used=layout.used, scale=scale, softmax_gate=softmax_gate,
+                q_sm,
+                k_sm,
+                v_sm,
+                used=layout.used,
+                scale=scale,
+                softmax_gate=softmax_gate,
             )
         else:
             window = windowed_softmax(
-                q_sm, k_sm, v_sm,
-                plan=meta.plan, layout=layout, scale=scale,
+                q_sm,
+                k_sm,
+                v_sm,
+                plan=meta.plan,
+                layout=layout,
+                scale=scale,
                 softmax_gate=softmax_gate,
             )  # [S_full, H_local, d]
 
@@ -362,8 +358,6 @@ class VDNMiniMaxH3AttnProcessor:
 
         # ---- linear (Video-Delta) branch, local heads over the video rows -----
         if need_linear:
-            q_raw = _seq_to_head_a2a(q[0])  # [S_full, H_local, d]
-            k_raw = _seq_to_head_a2a(k[0])
             v_raw = v_sm  # v is shared between the branches
             beta = _seq_to_head_a2a(beta.unsqueeze(-1)).squeeze(-1)  # [S_full, H_local]
             gate = _seq_to_head_a2a(gate)  # [S_full, H_local, d]
@@ -398,9 +392,7 @@ class VDNMiniMaxH3AttnProcessor:
             linear_full = q_raw.new_zeros(v_full, h_local, head_dim)
             linear_full[video] = linear.view(-1, h_local, head_dim).to(linear_full.dtype)
             linear_full = _head_to_seq_a2a(linear_full)  # [S_local, H, d]
-            out = out + attn.to_out_linear(
-                linear_full.reshape(s_local, heads * head_dim).to(out.dtype)
-            )
+            out = out + attn.to_out_linear(linear_full.reshape(s_local, heads * head_dim).to(out.dtype))
 
         out = attn.to_out[1](out)  # dropout (identity at inference)
         return out.unsqueeze(0)
@@ -415,8 +407,9 @@ class VDNMiniMaxH3AttnProcessor:
         """The hybrid attention over the FULL packed sequence (all heads)."""
         layout = meta.layout
         heads = attn.heads
-        head_dim = attn.to_q.out_features // heads if not attn.fused_projections \
-            else attn.to_qkv.out_features // (3 * heads)
+        head_dim = (
+            attn.to_q.out_features // heads if not attn.fused_projections else attn.to_qkv.out_features // (3 * heads)
+        )
         scale = 1.0 / math.sqrt(head_dim)
 
         x = hidden_states[0]  # [S, C]
@@ -447,13 +440,21 @@ class VDNMiniMaxH3AttnProcessor:
             window = torch.zeros_like(q_sm)
         elif meta.full_cover:
             window = dense_softmax(
-                q_sm, k_sm, v_sm,
-                used=layout.used, scale=scale, softmax_gate=softmax_gate,
+                q_sm,
+                k_sm,
+                v_sm,
+                used=layout.used,
+                scale=scale,
+                softmax_gate=softmax_gate,
             )
         else:
             window = windowed_softmax(
-                q_sm, k_sm, v_sm,
-                plan=meta.plan, layout=layout, scale=scale,
+                q_sm,
+                k_sm,
+                v_sm,
+                plan=meta.plan,
+                layout=layout,
+                scale=scale,
                 softmax_gate=softmax_gate,
             )
         out = attn.to_out[0](window.reshape(layout.seq_len, heads * head_dim))
@@ -468,11 +469,7 @@ class VDNMiniMaxH3AttnProcessor:
             v_raw = v[0]
             beta = branch.beta(x)  # [S, H]
             gate = branch.output_gate(x)  # [S, H, d]
-            frame_mean = (
-                x[video]
-                .view(layout.num_frames, layout.tokens_per_frame, -1)
-                .mean(dim=1, dtype=torch.float32)
-            )
+            frame_mean = x[video].view(layout.num_frames, layout.tokens_per_frame, -1).mean(dim=1, dtype=torch.float32)
             text_k = k_raw[text] if branch.hybrid.enable_text_state else None
             text_v = v_raw[text] if branch.hybrid.enable_text_state else None
             text_beta = beta[text] if branch.hybrid.enable_text_state else None
