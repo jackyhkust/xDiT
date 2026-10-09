@@ -288,9 +288,10 @@ class VDNMiniMaxH3AttnProcessor:
     ) -> torch.Tensor:
         """Head-sharded Ulysses hybrid attention.
 
-        Each rank projects its sequence shard with ALL heads, applies RoPE and the
+        Each rank projects its sequence shard with ALL heads, computes the
         per-(token, head) gates locally, then all-to-alls the per-head tensors into
-        [full sequence, local heads]. Both branches run on the local head slice, so
+        [full sequence, local heads]; QK-norm and RoPE are applied after the
+        all-to-all. Both branches run on the local head slice, so
         the window softmax and the Video-Delta scan FLOPs are divided across ranks.
         The per-head outputs are all-to-all'd back to [local sequence, all heads] and
         the shared output projections finish on the sequence shard. ``frame_mean``
@@ -320,13 +321,6 @@ class VDNMiniMaxH3AttnProcessor:
         k = k.unflatten(-1, (heads, -1))
         v = v.unflatten(-1, (heads, -1))
 
-        # window branch q/k: norm + RoPE (rope is this rank's sequence slice) ---
-        q_sm = attn.norm_q(q)
-        k_sm = attn.norm_k(k)
-        if rotary_emb is not None:
-            q_sm = _apply_rotary_emb(q_sm, *rotary_emb)
-            k_sm = _apply_rotary_emb(k_sm, *rotary_emb)
-
         # per-(token, head) gates, computed with all heads on the shard ---------
         softmax_gate = attn.softmax_gate(x) if attn.softmax_gate is not None else None
         branch = attn.linear_attention
@@ -337,9 +331,17 @@ class VDNMiniMaxH3AttnProcessor:
             frame_mean = self._video_frame_mean(x, rank, s_local, layout)  # [F, C]
 
         # ---- scatter heads / gather sequence ---------------------------------
-        q_sm = _seq_to_head_a2a(q_sm[0])  # [S_full, H_local, d]
-        k_sm = _seq_to_head_a2a(k_sm[0])
+        # Raw q/k cross once and feed both branches. QK-norm is per head and RoPE
+        # per token, so the window branch applies them after the all-to-all;
+        # rotary_emb covers the full padded sequence (_rope_full_sequence).
+        q_raw = _seq_to_head_a2a(q[0])  # [S_full, H_local, d]
+        k_raw = _seq_to_head_a2a(k[0])
         v_sm = _seq_to_head_a2a(v[0])
+        q_sm = attn.norm_q(q_raw)
+        k_sm = attn.norm_k(k_raw)
+        if rotary_emb is not None:
+            q_sm = _apply_rotary_emb(q_sm.unsqueeze(0), *rotary_emb)[0]
+            k_sm = _apply_rotary_emb(k_sm.unsqueeze(0), *rotary_emb)[0]
         if softmax_gate is not None:
             softmax_gate = _seq_to_head_a2a(softmax_gate.unsqueeze(-1)).squeeze(-1)
 
@@ -362,8 +364,6 @@ class VDNMiniMaxH3AttnProcessor:
 
         # ---- linear (Video-Delta) branch, local heads over the video rows -----
         if need_linear:
-            q_raw = _seq_to_head_a2a(q[0])  # [S_full, H_local, d]
-            k_raw = _seq_to_head_a2a(k[0])
             v_raw = v_sm  # v is shared between the branches
             beta = _seq_to_head_a2a(beta.unsqueeze(-1)).squeeze(-1)  # [S_full, H_local]
             gate = _seq_to_head_a2a(gate)  # [S_full, H_local, d]

@@ -44,6 +44,8 @@ def _padded_length(sequence_length: int) -> int:
 class xFuserMiniMaxH3VDNTransformer3DWrapper(xFuserMiniMaxH3Transformer3DWrapper):
     """MiniMax-H3 with VDN hybrid attention (window softmax + linear branch)."""
 
+    _rope_full_sequence = True
+
     def __init__(
         self,
         *,
