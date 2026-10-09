@@ -169,7 +169,7 @@ Individual model classes that inherit from `xFuserModel`:
 |----------|-------------|---------|
 | `--use_torch_compile` | Enable torch.compile acceleration | False |
 | `--gemm_quantization` | Transformer GEMM profile: `fp8`, `fp4`, `fp6`, `int8`, `low=fp4,high=fp8`, or `low=fp4,high=fp6` | none |
-| `--gemm_config` | Optional YAML file for advanced high-precision targets or an explicit FP8/FP4 schedule | None |
+| `--gemm_config` | Optional YAML file for advanced high-precision targets, an explicit FP8/FP4 schedule, or the pure-FP8 layer allowlist | None |
 | `--use_fp8_gemms`, `--use_fp4_gemms`, `--use_int8_gemms` | Deprecated format selectors retained for compatibility | False |
 | `--use_fp8_text_encoder` | Extend FP8 quantization to the text encoder as well; requires a profile containing FP8 | False |
 | `--use_hybrid_gemm_schedule` | Use the profile's FP8 or FP6 high format at the endpoints and FP4 in the middle | False |
@@ -217,6 +217,16 @@ not select precision; pass it separately, for example:
 ```bash
 --gemm_quantization low=fp4,high=fp6 \
 --gemm_config examples/gemm_config.yaml
+```
+
+With pure FP8, the YAML key `fp8_gemm_include_suffix_patterns` replaces the
+runner's FP8 layer-suffix allowlist. Without it, each runner keeps its default
+(for MiniMax-H3 and VDN-H3: `attn.to_qkv` and `ff.net.0.proj`). The key is
+rejected with any other profile. For example, FP8 on every VDN-H3 linear type:
+
+```bash
+--gemm_quantization fp8 \
+--gemm_config examples/gemm_config_fp8_vdn_h3.yaml
 ```
 
 INT8 uses per-row symmetric scaling and skips linear layers smaller than 512 in

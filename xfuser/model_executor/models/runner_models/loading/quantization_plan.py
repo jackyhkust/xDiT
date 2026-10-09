@@ -81,6 +81,25 @@ def apply_fp8_override_cli_to_settings(config, settings) -> None:
         )
 
 
+def apply_fp8_include_suffixes_to_settings(config, settings) -> None:
+    """Replace the runner's FP8 layer-suffix allowlist from YAML, for pure FP8 runs."""
+
+    raw = getattr(config, "fp8_gemm_include_suffix_patterns", None)
+    spec = getattr(config, "gemm_quantization_spec", None)
+    if raw is None or spec is None or not spec.is_pure("fp8"):
+        return
+    suffixes = tuple(dict.fromkeys(p.strip() for p in raw.split(",") if p.strip()))
+    if not suffixes:
+        return
+    previous = settings.fp8_gemm_include_suffixes
+    settings.fp8_gemm_include_suffixes = suffixes
+    log(
+        "FP8 GEMM include suffixes from --gemm_config: "
+        f"{', '.join(suffixes)} (runner default: "
+        f"{', '.join(previous) if previous else 'all linear layers'})."
+    )
+
+
 class QuantizationPlan:
     """Resolve declared FP8, FP4, FP6, and INT8 targets from one runner."""
 

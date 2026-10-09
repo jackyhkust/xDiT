@@ -397,3 +397,61 @@ def test_fp6_profile_supports_simple_hybrid_schedule(runtime):
     )
 
     config._validate_gemm_quantization_flags()
+
+
+def test_yaml_fp8_include_suffixes_replace_runner_allowlist(runtime, tmp_path, monkeypatch):
+    from xfuser.model_executor.models.runner_models.loading import quantization_plan
+    from xfuser.model_executor.models.runner_models.loading.quantization_plan import (
+        apply_fp8_include_suffixes_to_settings,
+    )
+
+    messages = []
+    monkeypatch.setattr(quantization_plan, "log", messages.append)
+    path = tmp_path / "gemm.yaml"
+    path.write_text(
+        "fp8_gemm_include_suffix_patterns: [attn.to_qkv, attn.to_out.0, ff.net.2, ff.net.2]\n"
+    )
+    config = _args(runtime, gemm_quantization="fp8", gemm_config=str(path))
+    config._validate_gemm_quantization_flags()
+    settings = SimpleNamespace(fp8_gemm_include_suffixes=("attn.to_qkv", "ff.net.0.proj"))
+
+    apply_fp8_include_suffixes_to_settings(config, settings)
+
+    assert settings.fp8_gemm_include_suffixes == ("attn.to_qkv", "attn.to_out.0", "ff.net.2")
+    assert messages == [
+        "FP8 GEMM include suffixes from --gemm_config: attn.to_qkv, attn.to_out.0, "
+        "ff.net.2 (runner default: attn.to_qkv, ff.net.0.proj)."
+    ]
+
+
+def test_yaml_fp8_include_suffixes_empty_keeps_runner_allowlist(runtime, tmp_path):
+    from xfuser.model_executor.models.runner_models.loading.quantization_plan import (
+        apply_fp8_include_suffixes_to_settings,
+    )
+
+    path = tmp_path / "gemm.yaml"
+    path.write_text("fp8_gemm_include_suffix_patterns: []\n")
+    config = _args(runtime, gemm_quantization="fp8", gemm_config=str(path))
+    settings = SimpleNamespace(fp8_gemm_include_suffixes=("attn.to_qkv", "ff.net.0.proj"))
+
+    apply_fp8_include_suffixes_to_settings(config, settings)
+
+    assert settings.fp8_gemm_include_suffixes == ("attn.to_qkv", "ff.net.0.proj")
+
+
+@pytest.mark.parametrize("profile", ["low=fp4,high=fp8", "fp4", "int8"])
+def test_yaml_fp8_include_suffixes_require_pure_fp8(runtime, tmp_path, profile):
+    path = tmp_path / "gemm.yaml"
+    path.write_text("fp8_gemm_include_suffix_patterns: [attn.to_out.0]\n")
+    config = _args(runtime, gemm_quantization=profile, gemm_config=str(path))
+
+    with pytest.raises(ValueError, match="requires --gemm_quantization fp8"):
+        config._validate_gemm_quantization_flags()
+
+
+def test_yaml_fp8_include_suffixes_reject_non_string_entries(runtime, tmp_path):
+    path = tmp_path / "gemm.yaml"
+    path.write_text("fp8_gemm_include_suffix_patterns: [1, 2]\n")
+
+    with pytest.raises(TypeError, match="fp8_gemm_include_suffix_patterns"):
+        _args(runtime, gemm_quantization="fp8", gemm_config=str(path))

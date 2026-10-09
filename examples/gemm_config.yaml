@@ -12,6 +12,16 @@ gemm_high_precision_module_patterns: []
 gemm_high_precision_prefix_patterns: []
 gemm_high_precision_suffix_patterns: []
 
+# Pure FP8 only (--gemm_quantization fp8; rejected with other profiles):
+# replace the runner's FP8 layer-suffix allowlist. Suffixes match layer-path
+# endings inside the runner's FP8 module roots, after any QKV fusion. Omit the
+# key, or leave it empty, to keep the runner default. See
+# examples/gemm_config_fp8_vdn_h3.yaml for a complete example.
+#
+# fp8_gemm_include_suffix_patterns:
+#   - attn.to_qkv
+#   - ff.net.0.proj
+
 # For an explicit schedule, uncomment this key and provide exactly one entry
 # per denoising step using the selected profile's format names. Use fp6 instead
 # of fp8 below with --gemm_quantization low=fp4,high=fp6. Do not combine this

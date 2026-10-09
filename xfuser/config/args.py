@@ -255,6 +255,8 @@ class xFuserArgs:
     gemm_high_precision_module_patterns: Optional[str] = None
     gemm_high_precision_prefix_patterns: Optional[str] = None
     gemm_high_precision_suffix_patterns: Optional[str] = None
+    # Set only through --gemm_config; replaces the runner's FP8 layer-suffix allowlist.
+    fp8_gemm_include_suffix_patterns: Optional[str] = None
     # Model runner specific
     num_iterations: int = 1
     determinism_check: int = 0
@@ -1404,6 +1406,11 @@ class xFuserArgs:
             raise ValueError(
                 "Advanced GEMM target settings require a low/high "
                 "--gemm_quantization profile."
+            )
+        if self.fp8_gemm_include_suffix_patterns is not None and not spec.is_pure("fp8"):
+            raise ValueError(
+                "YAML fp8_gemm_include_suffix_patterns requires "
+                "--gemm_quantization fp8."
             )
         if self.use_hybrid_gemm_schedule and not spec.is_tiered:
             raise ValueError(

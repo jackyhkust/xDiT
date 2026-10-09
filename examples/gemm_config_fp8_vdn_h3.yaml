@@ -1,0 +1,15 @@
+# FP8 on every linear type in the OpenVDN VDN-H3 transformer blocks.
+# Use with pure FP8 only:
+#   --gemm_quantization fp8 --gemm_config examples/gemm_config_fp8_vdn_h3.yaml
+#
+# Without this file, --gemm_quantization fp8 quantizes only attn.to_qkv and
+# ff.net.0.proj. The three extra layers measured -0.44 s (12.54 -> 12.10 s) on
+# example_2 (345 frames, 768x1344, compiled, Ulysses 8, AITER CK window) on
+# 8x MI355X. Same-seed PSNR against bf16 stays in the band of the default FP8
+# allowlist; review output quality before using it for production.
+fp8_gemm_include_suffix_patterns:
+  - attn.to_qkv          # fused Q/K/V projection
+  - ff.net.0.proj        # SwiGLU up/gate projection
+  - attn.to_out.0        # window-attention output projection
+  - attn.to_out_linear   # linear-attention (Video-Delta) output projection
+  - ff.net.2             # FFN down projection

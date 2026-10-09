@@ -61,6 +61,7 @@ from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadRoute,
 )
 from xfuser.model_executor.models.runner_models.loading.quantization_plan import (
+    apply_fp8_include_suffixes_to_settings,
     apply_fp8_override_cli_to_settings,
 )
 
@@ -309,6 +310,7 @@ class xFuserModel(abc.ABC):
     def _update_model_settings(self, config: xFuserArgs) -> None:
         if config.use_fp4_gemms:
             apply_fp8_override_cli_to_settings(config, self.settings)
+        apply_fp8_include_suffixes_to_settings(config, self.settings)
         te_targets = self.settings.fp8_text_encoder_module_list
         if te_targets and config.use_fp8_gemms and not config.use_fp8_text_encoder:
             # Said out loud because text-encoder FP8 is opt-in: an encoder left bf16 is otherwise

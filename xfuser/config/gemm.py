@@ -20,6 +20,7 @@ _CONFIG_SETTING_KEYS = frozenset(
         "gemm_high_precision_module_patterns",
         "gemm_high_precision_prefix_patterns",
         "gemm_high_precision_suffix_patterns",
+        "fp8_gemm_include_suffix_patterns",
         "hybrid_gemm_schedule",
     }
 )
@@ -140,6 +141,7 @@ def _normalize_config_setting(key: str, value):
         "gemm_high_precision_module_patterns",
         "gemm_high_precision_prefix_patterns",
         "gemm_high_precision_suffix_patterns",
+        "fp8_gemm_include_suffix_patterns",
     }:
         if value is None or isinstance(value, str):
             return value

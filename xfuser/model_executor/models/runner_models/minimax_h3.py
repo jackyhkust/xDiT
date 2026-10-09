@@ -834,14 +834,17 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
     settings.output_name = "vdn_minimax_h3"
     settings.valid_tasks = ["t2va"]
 
-    # Eager port: FSDP / fp8 / hybrid-attn schedule off. Ulysses is supported via
+    # Eager port: FSDP / fp4 / hybrid-attn schedule off. Ulysses is supported via
     # the VDN processor's gather/compute/scatter path (correct on N GPUs; not yet a
-    # per-head FLOP split). ModelCapabilities is frozen, so build one via replace().
+    # per-head FLOP split). FP8 GEMMs are opt-in via --gemm_quantization fp8 and
+    # default to the base H3 allowlist (attn.to_qkv, ff.net.0.proj); the YAML key
+    # fp8_gemm_include_suffix_patterns widens it. ModelCapabilities is frozen, so
+    # build one via replace().
     capabilities = dataclasses.replace(
         xFuserMiniMaxH3Model.capabilities,
         ulysses_degree=True,
         fully_shard_degree=False,
-        use_fp8_gemms=False,
+        use_fp8_gemms=True,
         use_fp4_gemms=False,
         use_hybrid_attn_schedule=False,
     )
