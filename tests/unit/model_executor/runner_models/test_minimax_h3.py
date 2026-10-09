@@ -599,6 +599,21 @@ def test_minimax_h3_fp8_quantization_policy():
     assert xFuserMiniMaxH3Ref2VAModel.settings.fp8_gemm_include_suffixes == expected
 
 
+def test_vdn_minimax_h3_fp8_quantization_policy():
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        xFuserVDNMiniMaxH3Model,
+    )
+
+    expected = (
+        "attn.to_qkv",
+        "ff.net.0.proj",
+        "attn.to_out.0",
+        "attn.to_out_linear",
+        "ff.net.2",
+    )
+    assert xFuserVDNMiniMaxH3Model.settings.fp8_gemm_include_suffixes == expected
+
+
 def test_minimax_h3_fp4_quantization_policy():
     from xfuser.model_executor.models.runner_models.minimax_h3 import (
         xFuserMiniMaxH3Model,

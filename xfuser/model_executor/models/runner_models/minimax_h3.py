@@ -842,15 +842,27 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
     settings.model_name = "MiniMaxAI/MiniMax-H3"
     settings.output_name = "vdn_minimax_h3"
     settings.valid_tasks = ["t2va"]
+    # VDN-H3 runs FP8 on all five transformer-block linear types, not the base
+    # H3 two-layer allowlist. The extra three (window/linear-branch outputs and
+    # the FFN down projection) measured -0.44 s on example_2 (345f, 8x MI355X)
+    # with same-seed PSNR/SSIM against bf16 inside the two-layer band.
+    settings.fp8_gemm_include_suffixes = (
+        "attn.to_qkv",  # fused Q/K/V projection
+        "ff.net.0.proj",  # SwiGLU up/gate projection
+        "attn.to_out.0",  # window-attention output projection
+        "attn.to_out_linear",  # linear-attention (Video-Delta) output projection
+        "ff.net.2",  # FFN down projection
+    )
 
-    # Eager port: FSDP / fp8 / hybrid-attn schedule off. Ulysses is supported via
+    # Eager port: FSDP / fp4 / hybrid-attn schedule off. Ulysses is supported via
     # the VDN processor's gather/compute/scatter path (correct on N GPUs; not yet a
-    # per-head FLOP split). ModelCapabilities is frozen, so build one via replace().
+    # per-head FLOP split). FP8 GEMMs are opt-in via --gemm_quantization fp8.
+    # ModelCapabilities is frozen, so build one via replace().
     capabilities = dataclasses.replace(
         xFuserMiniMaxH3Model.capabilities,
         ulysses_degree=True,
         fully_shard_degree=False,
-        use_fp8_gemms=False,
+        use_fp8_gemms=True,
         use_fp4_gemms=False,
         use_hybrid_attn_schedule=False,
     )
@@ -860,9 +872,7 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
 
         # Prefer the explicit CLI/config argument, then fall back to the env var
         # for backward compatibility.
-        directory = getattr(self.config, "vdn_transformer_dir", None) or os.environ.get(
-            VDN_H3_TRANSFORMER_DIR_ENV
-        )
+        directory = getattr(self.config, "vdn_transformer_dir", None) or os.environ.get(VDN_H3_TRANSFORMER_DIR_ENV)
         if not directory:
             raise RuntimeError(
                 "VDN-H3 needs the materialized transformer dir. Run "
@@ -936,21 +946,14 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
         if self.config.fully_shard_degree > 1:
             # Sharded compile path not validated for VDN yet; keep transformer
             # eager rather than risk an FSDP + hybrid-attention interaction.
-            log(
-                "VDN-H3: fully_shard_degree>1, keeping transformer eager "
-                "(sharded compile not validated)."
-            )
+            log("VDN-H3: fully_shard_degree>1, keeping transformer eager (sharded compile not validated).")
             return
 
         self._enable_compute_comm_overlap()
         transformer = getattr(self.pipe, self._transformer_component_name)
         original_forward = transformer.forward
-        compiled_forward = torch.compile(
-            original_forward, mode=mode, fullgraph=False
-        )
-        transformer.forward = _wrap_compiled_forward(
-            transformer, original_forward, compiled_forward
-        )
+        compiled_forward = torch.compile(original_forward, mode=mode, fullgraph=False)
+        transformer.forward = _wrap_compiled_forward(transformer, original_forward, compiled_forward)
         compile_args = copy.deepcopy(input_args)
         compile_args["num_inference_steps"] = self._warmup_num_inference_steps
         self._run_timed_pipe(compile_args)
