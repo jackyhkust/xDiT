@@ -37,6 +37,7 @@ from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
 from xfuser.model_executor.models.transformers.vdn_minimax_h3.attention import (
     attach_vdn_modules,
     build_vdn_meta,
+    ensure_ulysses_local_branch,
 )
 from xfuser.model_executor.models.transformers.vdn_minimax_h3.config import (
     VDNHybridAttentionArchConfig,
@@ -156,6 +157,7 @@ class xFuserMiniMaxH3VDNTransformer3DWrapper(xFuserMiniMaxH3Transformer3DWrapper
             self._vdn_meta_key = key
         for block in self.transformer_blocks:
             block.attn._vdn_meta = self._vdn_meta
+            ensure_ulysses_local_branch(block.attn)
 
     @staticmethod
     def _prime_vdn_meta_hook(module, args, kwargs) -> None:

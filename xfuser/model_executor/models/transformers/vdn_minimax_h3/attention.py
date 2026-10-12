@@ -199,6 +199,24 @@ def _build_local_branch(branch: MiniMaxH3VDNLinearBranch, h0: int, h1: int, d: i
     return local
 
 
+def ensure_ulysses_local_branch(attn: nn.Module) -> MiniMaxH3VDNLinearBranch | None:
+    """Build (once) and return this rank's head-sliced linear branch.
+
+    It creates ``nn.Parameter``s, which Dynamo cannot trace, so the transformer's
+    eager pre-hook calls this before the compiled forward ever reaches it.
+    """
+    world = get_ulysses_parallel_world_size()
+    if world <= 1:
+        return None
+    local = getattr(attn, "_vdn_local_branch", None)
+    if local is None:
+        h_local = attn.heads // world
+        h0 = get_ulysses_parallel_rank() * h_local
+        local = _build_local_branch(attn.linear_attention, h0, h0 + h_local, attn.linear_attention.head_dim)
+        attn._vdn_local_branch = local
+    return local
+
+
 def _seq_to_head_a2a(t: torch.Tensor) -> torch.Tensor:
     """[S_local, H, d] -> [S_full, H_local, d] (scatter heads, gather sequence)."""
     t = t.permute(1, 0, 2).unsqueeze(0).contiguous()  # [1, H, S_local, d]
@@ -280,6 +298,9 @@ class VDNMiniMaxH3AttnProcessor:
         the video rows it owns into the frame they belong to; an all-reduce then
         completes the sum. The per-frame token count is globally fixed
         (``tokens_per_frame``), so the mean is the reduced sum divided by it.
+
+        The video rows are contiguous, so the shard's share of them is a host-int
+        slice: no device reads, which keeps the block loop inside one compiled frame.
         """
         channels = x_local.shape[1]
         num_frames, tpf = layout.num_frames, layout.tokens_per_frame
@@ -326,8 +347,6 @@ class VDNMiniMaxH3AttnProcessor:
         scale = 1.0 / math.sqrt(head_dim)
         rank = get_ulysses_parallel_rank()
         h_local = heads // world
-        h0 = rank * h_local
-        h1 = h0 + h_local
 
         x = hidden_states[0]  # [S_local, C]
         s_local = x.shape[0]
@@ -405,10 +424,7 @@ class VDNMiniMaxH3AttnProcessor:
         if need_linear:
             v_raw = v_sm  # v is shared between the branches
 
-            local_branch = getattr(attn, "_vdn_local_branch", None)
-            if local_branch is None:
-                local_branch = _build_local_branch(branch, h0, h1, head_dim)
-                attn._vdn_local_branch = local_branch
+            local_branch = ensure_ulysses_local_branch(attn)
 
             video = slice(layout.video_start, layout.video_end)
             text = slice(0, layout.text_len)
@@ -551,4 +567,5 @@ __all__ = [
     "VDNMiniMaxH3AttnProcessor",
     "attach_vdn_modules",
     "build_vdn_meta",
+    "ensure_ulysses_local_branch",
 ]
