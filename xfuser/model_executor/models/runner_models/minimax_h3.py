@@ -913,14 +913,10 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
 
     def _compile_model(self, input_args: dict) -> None:
         # The VDN attention primes its packed-layout geometry from position_ids
-        # *values* in an eager forward pre-hook (device reads). That hook runs in
-        # nn.Module.__call__ before forward, so it stays eager regardless of how
-        # forward is compiled. The block forward itself does no device-value
-        # reads (only shape reads and python-bool meta guards), so we compile
-        # transformer.forward with fullgraph=False: graph breaks absorb any
-        # device-dependent branch while the bulk (gating/elementwise/casts/GEMM/
-        # attention) still fuses -- this is what recovers the ~24% unfused
-        # elementwise the eager path spent.
+        # *values* in an eager forward pre-hook (device reads), so it stays eager.
+        # The blocks do no device-value reads, so each repeated block compiles as
+        # one full graph. Compiling transformer.forward instead puts all blocks in
+        # one graph, which compiled 2.3x slower and ran slower on 8x MI355X.
         mode = self._get_compile_mode()
         vae = getattr(self.pipe, "vae", None)
         if vae is not None:
@@ -938,17 +934,11 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
 
         self._enable_compute_comm_overlap()
         transformer = getattr(self.pipe, self._transformer_component_name)
-        original_forward = transformer.forward
-        compiled_forward = torch.compile(
-            original_forward, mode=mode, fullgraph=False
-        )
-        transformer.forward = _wrap_compiled_forward(
-            transformer, original_forward, compiled_forward
-        )
+        transformer.compile_repeated_blocks(mode=mode, fullgraph=True)
         compile_args = copy.deepcopy(input_args)
         compile_args["num_inference_steps"] = self._warmup_num_inference_steps
         self._run_timed_pipe(compile_args)
-        log("VDN-H3: compiled transformer.forward (fullgraph=False).")
+        log("VDN-H3: compiled repeated transformer blocks (fullgraph=True).")
 
 
 @register_model("MiniMax-H3-Ref2VA")
