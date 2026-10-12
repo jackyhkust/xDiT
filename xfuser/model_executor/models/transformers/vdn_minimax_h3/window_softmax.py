@@ -43,9 +43,10 @@ _WINDOW_BACKENDS = ("sdpa", "aiter", "aiter_ck", "aiter_fp8")
 _WINDOW_BACKEND = "sdpa"  # set by set_window_backend() at load, before modules attach
 _AITER_VARLEN = None  # resolved lazily; set to False after a failed import
 _AITER_FP8_VARLEN = None  # (xfuser::aiter_fp8_varlen, hadamard) set by prepare_window_backend
-_AITER_FP8_LOGGED = False
 _AITER_CK_OP = None
-_AITER_CK_LOGGED = False
+_AITER_TRITON_OP = None
+_SDPA_OP = None
+_BACKEND_LOGGED = False
 
 
 # --------------------------------------------------------------------------
@@ -262,7 +263,7 @@ class DecomposedPlan:
 def _ensure_aiter_ck_op():
     """Register one opaque CK varlen op so torch.compile does not trace AITER.
 
-    Called at module attach, before ``transformer.forward`` is compiled.
+    Called at module attach, before the transformer blocks are compiled.
     """
     global _AITER_CK_OP
     if _AITER_CK_OP is not None:
@@ -335,22 +336,94 @@ def set_window_backend(name: str) -> None:
     _WINDOW_BACKEND = backend
 
 
+def _ensure_sdpa_op():
+    """Register the per-segment SDPA loop as one opaque op.
+
+    The loop reads the segment boundaries on the host (``tolist``), which
+    ``fullgraph=True`` cannot trace. Called at module attach, before the
+    transformer blocks are compiled.
+    """
+    global _SDPA_OP
+    if _SDPA_OP is not None:
+        return _SDPA_OP
+
+    def _vdn_sdpa_varlen(q, k, v, cu_q, cu_k, scale):
+        out = torch.empty_like(q)
+        cq = cu_q.tolist()
+        ck = cu_k.tolist()
+        for i in range(len(cq) - 1):
+            q0, q1 = cq[i], cq[i + 1]
+            k0, k1 = ck[i], ck[i + 1]
+            if q1 <= q0:
+                continue
+            qi = q[q0:q1].transpose(0, 1).unsqueeze(0)  # [1, H, Lq, d]
+            ki = k[k0:k1].transpose(0, 1).unsqueeze(0)
+            vi = v[k0:k1].transpose(0, 1).unsqueeze(0)
+            oi = F.scaled_dot_product_attention(qi, ki, vi, dropout_p=0.0, is_causal=False, scale=float(scale))
+            out[q0:q1] = oi.squeeze(0).transpose(0, 1)
+        return out
+
+    def _vdn_sdpa_varlen_fake(q, k, v, cu_q, cu_k, scale):
+        return torch.empty_like(q)
+
+    # This module uses postponed annotations. The op schema needs real types.
+    _annotations = {
+        "q": torch.Tensor,
+        "k": torch.Tensor,
+        "v": torch.Tensor,
+        "cu_q": torch.Tensor,
+        "cu_k": torch.Tensor,
+        "scale": float,
+        "return": torch.Tensor,
+    }
+    _vdn_sdpa_varlen.__annotations__ = _annotations
+    _vdn_sdpa_varlen_fake.__annotations__ = _annotations
+    op = torch.library.custom_op("xfuser::vdn_sdpa_varlen", mutates_args=())(_vdn_sdpa_varlen)
+    op.register_fake(_vdn_sdpa_varlen_fake)
+
+    _SDPA_OP = op
+    return _SDPA_OP
+
+
 def prepare_window_backend() -> None:
-    """Register the selected window backend's op(s) before the compiled forward runs."""
-    global _AITER_CK_LOGGED
-    if _WINDOW_BACKEND == "aiter_fp8":
+    """Resolve ``VDN_WINDOW_BACKEND`` before the transformer blocks are compiled.
+
+    The blocks compile with ``fullgraph=True``, so the import fallback and the op
+    registration happen here, not in the traced ``_varlen``.
+    """
+    global _WINDOW_BACKEND, _BACKEND_LOGGED
+    if _WINDOW_BACKEND == "ck":
+        _WINDOW_BACKEND = "aiter_ck"
+    if _WINDOW_BACKEND == "aiter":
+        try:
+            _ensure_aiter_triton_op()
+        except (ImportError, AttributeError) as exc:
+            logger.warning(
+                "AITER Triton varlen unavailable for VDN-H3 window softmax (%s); falling back to SDPA.",
+                exc,
+            )
+            _WINDOW_BACKEND = "sdpa"
+    if _WINDOW_BACKEND == "aiter_ck":
+        _ensure_aiter_ck_op()
+        message = "AITER CK varlen (one flash_attn_varlen_func call per group)."
+    elif _WINDOW_BACKEND == "aiter":
+        message = "AITER Triton varlen (xfuser::vdn_aiter_triton_varlen)."
+    elif _WINDOW_BACKEND == "aiter_fp8":
         _ensure_aiter_fp8_parts()
-    if _WINDOW_BACKEND != "aiter_ck":
+        message = "AITER FP8 varlen (per-tensor, Hadamard-rotated Q/K)."
+    elif _WINDOW_BACKEND == "sdpa":
+        _ensure_sdpa_op()
+        message = "per-segment SDPA (xfuser::vdn_sdpa_varlen)."
+    else:
         return
-    _ensure_aiter_ck_op()
-    if _AITER_CK_LOGGED:
+    if _BACKEND_LOGGED:
         return
-    _AITER_CK_LOGGED = True
+    _BACKEND_LOGGED = True
     rank0 = True
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank0 = torch.distributed.get_rank() == 0
     if rank0:
-        logger.info("VDN-H3 window softmax: AITER CK varlen (one flash_attn_varlen_func call per group).")
+        logger.info("VDN-H3 window softmax: %s", message)
 
 
 def _aiter_ck_varlen(
@@ -377,6 +450,55 @@ def _aiter_triton_varlen_func():
     return _AITER_VARLEN
 
 
+def _ensure_aiter_triton_op():
+    """Register the AITER Triton varlen call as one opaque op.
+
+    AITER resolves its kernel config from disk on each call, which
+    ``fullgraph=True`` cannot trace.
+    """
+    global _AITER_TRITON_OP
+    if _AITER_TRITON_OP is not None:
+        return _AITER_TRITON_OP
+    varlen = _aiter_triton_varlen_func()
+
+    def _vdn_aiter_triton_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+        out = varlen(
+            q=q.contiguous(),
+            k=k.contiguous(),
+            v=v.contiguous(),
+            cu_seqlens_q=cu_q.to(device=q.device, dtype=torch.int32).contiguous(),
+            cu_seqlens_k=cu_k.to(device=k.device, dtype=torch.int32).contiguous(),
+            max_seqlen_q=int(max_q),
+            max_seqlen_k=int(max_k),
+            softmax_scale=float(scale),
+            causal=False,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    def _vdn_aiter_triton_varlen_fake(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+        return torch.empty_like(q)
+
+    # This module uses postponed annotations. The op schema needs real types.
+    _annotations = {
+        "q": torch.Tensor,
+        "k": torch.Tensor,
+        "v": torch.Tensor,
+        "cu_q": torch.Tensor,
+        "cu_k": torch.Tensor,
+        "max_q": int,
+        "max_k": int,
+        "scale": float,
+        "return": torch.Tensor,
+    }
+    _vdn_aiter_triton_varlen.__annotations__ = _annotations
+    _vdn_aiter_triton_varlen_fake.__annotations__ = _annotations
+    op = torch.library.custom_op("xfuser::vdn_aiter_triton_varlen", mutates_args=())(_vdn_aiter_triton_varlen)
+    op.register_fake(_vdn_aiter_triton_varlen_fake)
+
+    _AITER_TRITON_OP = op
+    return _AITER_TRITON_OP
+
+
 def _sdpa_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -390,20 +512,7 @@ def _sdpa_varlen(
 
     ``cu_q`` / ``cu_k`` are the cumulative segment boundaries (int32). Returns
     [Tq, H, d]."""
-    out = torch.empty_like(q)
-    cq = cu_q.tolist()
-    ck = cu_k.tolist()
-    for i in range(len(cq) - 1):
-        q0, q1 = cq[i], cq[i + 1]
-        k0, k1 = ck[i], ck[i + 1]
-        if q1 <= q0:
-            continue
-        qi = q[q0:q1].transpose(0, 1).unsqueeze(0)  # [1, H, Lq, d]
-        ki = k[k0:k1].transpose(0, 1).unsqueeze(0)
-        vi = v[k0:k1].transpose(0, 1).unsqueeze(0)
-        oi = F.scaled_dot_product_attention(qi, ki, vi, dropout_p=0.0, is_causal=False, scale=scale)
-        out[q0:q1] = oi.squeeze(0).transpose(0, 1)
-    return out
+    return _ensure_sdpa_op()(q, k, v, cu_q, cu_k, float(scale))
 
 
 def _ensure_aiter_fp8_parts():
@@ -440,15 +549,7 @@ def _aiter_fp8_varlen(
     ``xfuser::aiter_fp8_varlen`` custom op, so torch.compile treats them as one
     opaque node.
     """
-    global _AITER_FP8_LOGGED
     kernel, hadamard = _ensure_aiter_fp8_parts()
-    if not _AITER_FP8_LOGGED:
-        _AITER_FP8_LOGGED = True
-        rank0 = True
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank0 = torch.distributed.get_rank() == 0
-        if rank0:
-            logger.info("VDN-H3 window softmax: AITER FP8 varlen (per-tensor, Hadamard-rotated Q/K).")
     q_rot, k_rot = hadamard.rotate_qk(q, k)
     out = kernel(
         q_rot,
@@ -479,7 +580,6 @@ def _varlen(
     max_k: int,
     scale: float,
 ) -> torch.Tensor:
-    global _WINDOW_BACKEND
     if _WINDOW_BACKEND == "aiter_fp8":
         return _aiter_fp8_varlen(
             q,
@@ -503,25 +603,7 @@ def _varlen(
             scale=scale,
         )
     if _WINDOW_BACKEND == "aiter":
-        try:
-            out = _aiter_triton_varlen_func()(
-                q=q.contiguous(),
-                k=k.contiguous(),
-                v=v.contiguous(),
-                cu_seqlens_q=cu_q.to(device=q.device, dtype=torch.int32).contiguous(),
-                cu_seqlens_k=cu_k.to(device=k.device, dtype=torch.int32).contiguous(),
-                max_seqlen_q=max_q,
-                max_seqlen_k=max_k,
-                softmax_scale=scale,
-                causal=False,
-            )
-            return out[0] if isinstance(out, tuple) else out
-        except (ImportError, TypeError, RuntimeError) as exc:
-            logger.warning(
-                "AITER Triton varlen unavailable for VDN-H3 window softmax (%s); falling back to SDPA.",
-                exc,
-            )
-            _WINDOW_BACKEND = "sdpa"
+        return _ensure_aiter_triton_op()(q, k, v, cu_q, cu_k, int(max_q), int(max_k), float(scale))
     return _sdpa_varlen(q, k, v, cu_q=cu_q, cu_k=cu_k, scale=scale)
 
 
