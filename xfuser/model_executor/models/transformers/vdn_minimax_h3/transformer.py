@@ -13,8 +13,9 @@ Subclasses ``xFuserMiniMaxH3Transformer3DWrapper``. Beyond the dense H3 stack it
   tensors (which need device reads and so must run eager, outside any compiled
   region), and stashes it on each ``attn._vdn_meta``.
 
-Single-GPU eager only: Ulysses is deferred, so every block sees the full padded
-sequence and ``local_heads == num_attention_heads``.
+Supports Ulysses sequence parallelism: the attention processor all-to-alls
+q/k/v into a per-head shard, so each block computes on ``local_heads`` of the
+full padded sequence.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VDN-H3 window softmax on the packed MiniMax-H3 layout, single-GPU eager.
+"""VDN-H3 window softmax on the packed MiniMax-H3 layout.
 
 An exact softmax over a chunk-aligned frame window: frame t belongs to chunk
 t // chunk and attends to chunks [c - radius, c + radius]; frames 0 and F-1 are
