@@ -821,10 +821,11 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
 
     Reuses the base MiniMax-H3 modular pipeline (scheduler, VAEs, Qwen3-VL text
     encoder), but swaps the transformer for the VDN hybrid-attention wrapper
-    loaded from a materialized VDN transformer dir. Single-GPU eager in this
-    pass: the VDN attention primes its packed-layout geometry from position_ids
-    values in an eager forward pre-hook, so torch.compile of the transformer is
-    disabled here; Ulysses sequence parallelism is deferred.
+    loaded from a materialized VDN transformer dir. Supports Ulysses sequence
+    parallelism (head-sharded attention) and torch.compile of the transformer
+    (fullgraph=False): the VDN attention primes its packed-layout geometry from
+    position_ids values in an eager forward pre-hook, which compile graph-breaks
+    around.
     """
 
     default_input_values = DefaultInputValues(
@@ -854,9 +855,9 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
         "ff.net.2",  # FFN down projection
     )
 
-    # Eager port: FSDP / fp4 / hybrid-attn schedule off. Ulysses is supported via
-    # the VDN processor's gather/compute/scatter path (correct on N GPUs; not yet a
-    # per-head FLOP split). FP8 GEMMs are opt-in via --gemm_quantization fp8.
+    # FSDP / fp4 / hybrid-attn schedule off. Ulysses is supported via the VDN
+    # processor's head-sharded all-to-all path (per-head FLOP split, correct on
+    # N GPUs). FP8 GEMMs are opt-in via --gemm_quantization fp8.
     # ModelCapabilities is frozen, so build one via replace().
     capabilities = dataclasses.replace(
         xFuserMiniMaxH3Model.capabilities,

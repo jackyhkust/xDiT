@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VDN-H3 (Video DeltaNet MiniMax-H3) hybrid attention for xDiT, single-GPU eager.
+"""VDN-H3 (Video DeltaNet MiniMax-H3) hybrid attention for xDiT.
 
 This package ports OpenVDN/vdn-minimax-h3's hybrid attention (a chunk-aligned
 frame-window softmax plus a bidirectional Video-Delta linear branch) onto xDiT's
-MiniMax-H3 transformer. It reimplements the SGLang reference eagerly, with no
-Ulysses/tensor-parallel sharding: ``local_heads == num_attention_heads`` and the
-per-request metadata is built for the full local sequence.
+MiniMax-H3 transformer. Head-sharded Ulysses sequence parallelism is supported:
+each rank's attention processor works on ``local_heads`` of the full sequence.
 
 The submodule/parameter names match the VDN overlay checkpoint's linear-branch
 keys (``transformer_blocks.N.attn.{linear_attention.*, softmax_gate.*,
