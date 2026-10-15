@@ -925,6 +925,12 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
         pipe.transformer.fuse_qkv_projections()
         pipe.text_encoder.lm_head = None
         self._parallelize_text_encoder(pipe.text_encoder)
+        # MiniMaxH3Scheduler runs one step fewer than requested, so count
+        # scheduler steps as transformer forwards -- same as the base H3 and
+        # Ref2VA runners. Without this VDN-H3 ran one fewer forward than
+        # num_inference_steps requested.
+        _count_steps_as_forwards(pipe.scheduler)
+        _count_steps_as_forwards(pipe.audio_scheduler)
         return pipe
 
     def _compile_model(self, input_args: dict) -> None:
