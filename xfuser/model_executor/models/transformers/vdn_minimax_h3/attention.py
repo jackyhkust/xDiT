@@ -1,4 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+#
+# Ported from OpenVDN / Video DeltaNet (VDN-H3): Apache-2.0, Copyright 2026 the
+# VDN authors. https://github.com/OpenVDN/vdn-minimax-h3 (commit e262cb5)
+#   source: src/models/hybrid_attention.py, attention_gates.py,
+#           src/models/softmax_attention/dense_processor.py
+# Cross-referenced with SGLang's hybrid_window_attn_h3 diffusion integration
+# (https://github.com/sgl-project/sglang, Apache-2.0).
 """VDN-H3 hybrid attention for xDiT: window softmax + Video-Delta linear branch.
 
 The diffusers ``MiniMaxH3Attention`` keeps its dense q/k/v/out projections; VDN
@@ -206,6 +213,30 @@ def _head_to_seq_a2a(t: torch.Tensor) -> torch.Tensor:
     return t[0].permute(1, 0, 2).contiguous()  # [S_local, H, d]
 
 
+def _seq_to_head_a2a_batched(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """One seq->head all-to-all for several ``[S_local, H, f_i]`` tensors.
+
+    They share the scattered head dim, so concatenating along the feature dim and
+    splitting after the exchange is lossless. This collapses the six separate
+    inbound collectives (q, k, v, gate, beta, softmax_gate) into a single one.
+    """
+    if len(tensors) == 1:
+        return (_seq_to_head_a2a(tensors[0]),)
+    sizes = [t.shape[-1] for t in tensors]
+    packed = _seq_to_head_a2a(torch.cat(tensors, dim=-1))  # [S_full, H_local, sum(f_i)]
+    return torch.split(packed, sizes, dim=-1)
+
+
+def _head_to_seq_a2a_batched(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """One head->seq all-to-all for several ``[S_full, H_local, f_i]`` tensors
+    (the window and linear readouts), splitting them back out afterwards."""
+    if len(tensors) == 1:
+        return (_head_to_seq_a2a(tensors[0]),)
+    sizes = [t.shape[-1] for t in tensors]
+    packed = _head_to_seq_a2a(torch.cat(tensors, dim=-1))  # [S_local, H, sum(f_i)]
+    return torch.split(packed, sizes, dim=-1)
+
+
 class VDNMiniMaxH3AttnProcessor:
     """Hybrid attention: window softmax + Video-Delta linear branch.
 
@@ -254,12 +285,17 @@ class VDNMiniMaxH3AttnProcessor:
         num_frames, tpf = layout.num_frames, layout.tokens_per_frame
         sums = x_local.new_zeros(num_frames, channels, dtype=torch.float32)
         if num_frames > 0:
+            # The rank owns the contiguous global rows [g0, g0 + s_local); its
+            # video rows are therefore [max(g0, video_start), min(end, video_end)).
+            # Computing that overlap from host ints avoids the device->host sync
+            # (and the graph break) of the previous ``bool(vmask.any())`` guard.
             g0 = rank * s_local
-            gidx = torch.arange(g0, g0 + s_local, device=x_local.device)
-            vmask = (gidx >= layout.video_start) & (gidx < layout.video_end)
-            if bool(vmask.any()):
-                frame = (gidx[vmask] - layout.video_start) // tpf
-                sums.index_add_(0, frame, x_local[vmask].float())
+            lo = max(g0, layout.video_start)
+            hi = min(g0 + s_local, layout.video_end)
+            if lo < hi:
+                rows = x_local[lo - g0 : hi - g0].float()
+                frame = (torch.arange(lo, hi, device=x_local.device) - layout.video_start) // tpf
+                sums.index_add_(0, frame, rows)
         sums = get_sp_group().all_reduce(sums)
         return sums / tpf
 
@@ -316,20 +352,33 @@ class VDNMiniMaxH3AttnProcessor:
             gate = branch.output_gate(x)  # [S_local, H, d]
             frame_mean = self._video_frame_mean(x, rank, s_local, layout)  # [F, C]
 
-        # ---- scatter heads / gather sequence ---------------------------------
-        # Raw q/k cross once and feed both branches. QK-norm is per head and RoPE
-        # per token, so the window branch applies them after the all-to-all;
-        # rotary_emb covers the full padded sequence (_rope_full_sequence).
-        q_raw = _seq_to_head_a2a(q[0])  # [S_full, H_local, d]
-        k_raw = _seq_to_head_a2a(k[0])
-        v_sm = _seq_to_head_a2a(v[0])
+        # ---- scatter heads / gather sequence (one batched all-to-all) --------
+        # Every per-token tensor shares the scattered head dim, so q/k/v, the
+        # softmax gate, and the linear branch's gate/beta ride a single inbound
+        # exchange instead of up to six. QK-norm is per head and RoPE per token,
+        # so the window branch applies them after the all-to-all; rotary_emb
+        # covers the full padded sequence (_rope_full_sequence).
+        send = [q[0], k[0], v[0]]  # each [S_local, H, d]
+        if softmax_gate is not None:
+            send.append(softmax_gate.unsqueeze(-1))
+        if need_linear:
+            send.append(gate)  # [S_local, H, d]
+            send.append(beta.unsqueeze(-1))
+        recv = iter(_seq_to_head_a2a_batched(*send))
+        q_raw = next(recv)  # [S_full, H_local, d]
+        k_raw = next(recv)
+        v_sm = next(recv)
+        if softmax_gate is not None:
+            softmax_gate = next(recv).squeeze(-1)  # [S_full, H_local]
+        if need_linear:
+            gate = next(recv)  # [S_full, H_local, d]
+            beta = next(recv).squeeze(-1)  # [S_full, H_local]
+
         q_sm = attn.norm_q(q_raw)
         k_sm = attn.norm_k(k_raw)
         if rotary_emb is not None:
             q_sm = _apply_rotary_emb(q_sm.unsqueeze(0), *rotary_emb)[0]
             k_sm = _apply_rotary_emb(k_sm.unsqueeze(0), *rotary_emb)[0]
-        if softmax_gate is not None:
-            softmax_gate = _seq_to_head_a2a(softmax_gate.unsqueeze(-1)).squeeze(-1)
 
         # ---- window (softmax) branch, local heads over the full sequence ------
         if meta.full_cover:
@@ -352,15 +401,9 @@ class VDNMiniMaxH3AttnProcessor:
                 softmax_gate=softmax_gate,
             )  # [S_full, H_local, d]
 
-        # gather heads / scatter sequence, then the shared output projection ----
-        window = _head_to_seq_a2a(window)  # [S_local, H, d]
-        out = attn.to_out[0](window.reshape(s_local, heads * head_dim))
-
         # ---- linear (Video-Delta) branch, local heads over the video rows -----
         if need_linear:
             v_raw = v_sm  # v is shared between the branches
-            beta = _seq_to_head_a2a(beta.unsqueeze(-1)).squeeze(-1)  # [S_full, H_local]
-            gate = _seq_to_head_a2a(gate)  # [S_full, H_local, d]
 
             local_branch = getattr(attn, "_vdn_local_branch", None)
             if local_branch is None:
@@ -388,11 +431,26 @@ class VDNMiniMaxH3AttnProcessor:
             # Scatter the video-row readout back into a full-sequence buffer so the
             # inverse all-to-all sees a sequence length divisible by the world size;
             # non-video rows stay zero and project to zero (to_out_linear has no bias).
-            v_full = layout.seq_len
-            linear_full = q_raw.new_zeros(v_full, h_local, head_dim)
+            linear_full = q_raw.new_zeros(layout.seq_len, h_local, head_dim)
             linear_full[video] = linear.view(-1, h_local, head_dim).to(linear_full.dtype)
-            linear_full = _head_to_seq_a2a(linear_full)  # [S_local, H, d]
-            out = out + attn.to_out_linear(linear_full.reshape(s_local, heads * head_dim).to(out.dtype))
+            # Window and linear readouts share [S_full, H_local, d], so one batched
+            # outbound exchange carries both back to the sequence shard.
+            window, linear_local = _head_to_seq_a2a_batched(window, linear_full)
+            out = attn.to_out[0](window.reshape(s_local, heads * head_dim))
+            # Only the rank's video rows are non-zero (to_out_linear has no bias),
+            # so project just those and skip the matmul on the zero rows.
+            g0 = rank * s_local
+            lo = max(g0, layout.video_start)
+            hi = min(g0 + s_local, layout.video_end)
+            if lo < hi:
+                rows = slice(lo - g0, hi - g0)
+                contrib = attn.to_out_linear(linear_local[rows].reshape(hi - lo, heads * head_dim).to(out.dtype))
+                contrib_full = out.new_zeros(s_local, out.shape[-1])
+                contrib_full[rows] = contrib
+                out = out + contrib_full
+        else:
+            window = _head_to_seq_a2a(window)  # [S_local, H, d]
+            out = attn.to_out[0](window.reshape(s_local, heads * head_dim))
 
         out = attn.to_out[1](out)  # dropout (identity at inference)
         return out.unsqueeze(0)
