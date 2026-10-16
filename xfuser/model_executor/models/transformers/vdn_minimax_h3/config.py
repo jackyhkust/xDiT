@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+#
+# Ported from OpenVDN / Video DeltaNet (VDN-H3): Apache-2.0, Copyright 2026 the
+# VDN authors. https://github.com/OpenVDN/vdn-minimax-h3 (commit e262cb5)
+#   source: src/models/hybrid_transform.py, src/models/hybrid_attention.py
+# Cross-referenced with SGLang's hybrid_window_attn_h3 diffusion integration
+# (https://github.com/sgl-project/sglang, Apache-2.0).
 """VDN-H3 hybrid attention architecture config (window softmax + linear branch).
 
-Ported verbatim (behaviourally) from SGLang's
-``configs/models/dits/minimax_h3_vdn.py``. This is the resolved
-``hybrid_attention`` transform config that lives in the materialized VDN
-``transformer/config.json``. A dense checkpoint has none.
+Mirrors the VDN ``hybrid_attention`` transform config (the resolved block that
+lives in the materialized VDN ``transformer/config.json``). A dense checkpoint
+has none.
 """
 
 from __future__ import annotations

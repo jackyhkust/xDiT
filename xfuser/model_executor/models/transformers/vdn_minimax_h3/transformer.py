@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+#
+# Ported from OpenVDN / Video DeltaNet (VDN-H3): Apache-2.0, Copyright 2026 the
+# VDN authors. https://github.com/OpenVDN/vdn-minimax-h3 (commit e262cb5)
+#   source: src/models/hybrid_transform.py
+# Cross-referenced with SGLang's hybrid_window_attn_h3 diffusion integration
+# (https://github.com/sgl-project/sglang, Apache-2.0).
 """VDN-H3 transformer wrapper for xDiT: base MiniMax-H3 + hybrid attention.
 
 Subclasses ``xFuserMiniMaxH3Transformer3DWrapper``. Beyond the dense H3 stack it:

@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+#
+# Ported from OpenVDN / Video DeltaNet (VDN-H3): Apache-2.0, Copyright 2026 the
+# VDN authors. https://github.com/OpenVDN/vdn-minimax-h3 (commit e262cb5)
+#   source: src/models/linear_attention/{branch,delta_rule,scan,features,layers}.py
+# Cross-referenced with SGLang's hybrid_window_attn_h3 diffusion integration
+# (https://github.com/sgl-project/sglang, Apache-2.0).
 """VDN-H3 (Video DeltaNet MiniMax-H3) linear attention branch, eager single-GPU.
 
-Reimplementation of OpenVDN's ``BidirectionalLinearBranch`` for xDiT, following
-SGLang's ``runtime/models/dits/minimax_h3_vdn.py`` reference. The branch
+Reimplementation of OpenVDN's ``BidirectionalLinearBranch`` for xDiT. The branch
 summarises everything the chunked window softmax cannot see, for every video
 token, in five steps:
 
