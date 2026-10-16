@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+#
+# Ported from OpenVDN / Video DeltaNet (VDN-H3): Apache-2.0, Copyright 2026 the
+# VDN authors. https://github.com/OpenVDN/vdn-minimax-h3 (commit e262cb5)
+#   source: src/models/softmax_attention/window.py, decomposed.py
+# Cross-referenced with SGLang's hybrid_window_attn_h3 diffusion integration
+# (https://github.com/sgl-project/sglang, Apache-2.0).
 """VDN-H3 window softmax on the packed MiniMax-H3 layout.
 
 An exact softmax over a chunk-aligned frame window: frame t belongs to chunk
