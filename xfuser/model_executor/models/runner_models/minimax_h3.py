@@ -60,6 +60,22 @@ _SUPPORTED_ATTN_BACKENDS = frozenset(
     }
 ) | (AITER_MHA_V4_ONLY_BACKEND_SET - _UNSERVED_MHA_V4_BACKENDS)
 _FASTH3_ATTN_BACKENDS = VSA_H3_BACKENDS
+# VDN-H3's window varlen executor only implements these three; it does not use
+# the CUDNN / NVTE_FP8 / MHA-v4 paths the base H3 advertises.
+_VDN_SUPPORTED_ATTN_BACKENDS = frozenset(
+    {
+        AttentionBackendType.SDPA,
+        AttentionBackendType.AITER,
+        AttentionBackendType.AITER_FP8,
+    }
+)
+# --attention_backend -> VDN window kernel. AITER maps to the CK/ASM varlen; the
+# Triton varlen ("aiter") is reachable only via --vdn_window_backend.
+_VDN_WINDOW_BACKEND_FOR_ATTENTION = {
+    AttentionBackendType.SDPA: "sdpa",
+    AttentionBackendType.AITER: "aiter_ck",
+    AttentionBackendType.AITER_FP8: "aiter_fp8",
+}
 _SUPPORTED_ULYSSES_DEGREES = frozenset({1, 2, 4, 8})
 _SUPPORTED_TASKS = frozenset({"t2va", "i2va", "l2va", "fl2va", "ref2va"})
 FASTH3_V1_DATAFREE_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
@@ -868,6 +884,17 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
         use_hybrid_attn_schedule=False,
     )
 
+    supported_attn_backends = _VDN_SUPPORTED_ATTN_BACKENDS
+
+    def _resolve_window_backend(self) -> str:
+        """Pick the window varlen kernel: --vdn_window_backend wins, else derive
+        it from --attention_backend (SDPA/AITER/AITER_FP8), defaulting to SDPA."""
+        override = getattr(self.config, "vdn_window_backend", None)
+        if override:
+            return override
+        backend = _parse_attention_backend(getattr(self.config, "attention_backend", None), "attention backend")
+        return _VDN_WINDOW_BACKEND_FOR_ATTENTION.get(backend, "sdpa")
+
     def _vdn_transformer_dir(self) -> str:
         import os
 
@@ -902,8 +929,12 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
         from xfuser.model_executor.models.transformers.vdn_minimax_h3.transformer import (
             xFuserMiniMaxH3VDNTransformer3DWrapper,
         )
+        from xfuser.model_executor.models.transformers.vdn_minimax_h3.window_softmax import (
+            set_window_backend,
+        )
 
         vdn_dir = self._vdn_transformer_dir()
+        set_window_backend(self._resolve_window_backend())
         workflow = "t2va" if self.config.task == "t2va" else "fl2va"
         log(f"Loading VDN-H3 {workflow.upper()} components (transformer: {vdn_dir})")
         if self.config.text_encoder_tp_degree <= 1:
