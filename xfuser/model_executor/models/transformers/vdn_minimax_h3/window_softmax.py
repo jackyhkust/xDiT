@@ -9,19 +9,17 @@ outside every mask; a per-(token, head) sigmoid gate scales the output.
 The window runs as a union of dense varlen attention calls: the dense-query rows
 against all keys, then per-chunk gathered ``[globals | window | anchors]`` K/V.
 This mirrors SGLang's ``hybrid_window_attn_h3`` decomposition. The varlen executor
-defaults to a per-segment SDPA (correct on ROCm and CUDA). Set
-``VDN_WINDOW_BACKEND=aiter`` for AITER's Triton varlen bf16 kernel (SDPA
-fallback), ``VDN_WINDOW_BACKEND=aiter_ck`` for one AITER CK/ASM
-``flash_attn_varlen_func`` call per varlen group, or
-``VDN_WINDOW_BACKEND=aiter_fp8`` for AITER per-tensor FP8 varlen
-(Hadamard-rotated Q/K, same kernel as ``--attention_backend AITER_FP8``).
+is selected from ``--attention_backend`` (SDPA -> per-segment SDPA, correct on ROCm
+and CUDA; AITER -> one AITER CK/ASM ``flash_attn_varlen_func`` call per varlen group;
+AITER_FP8 -> AITER per-tensor FP8 varlen with Hadamard-rotated Q/K). The
+``--vdn_window_backend`` flag overrides it directly with one of sdpa / aiter /
+aiter_ck / aiter_fp8 (``aiter`` is AITER's Triton varlen bf16 kernel, SDPA fallback).
 """
 
 from __future__ import annotations
 
 import functools
 import logging
-import os
 
 import torch
 import torch.nn.functional as F
@@ -35,7 +33,8 @@ from xfuser.model_executor.models.transformers.vdn_minimax_h3.linear_branch impo
 
 logger = logging.getLogger(__name__)
 
-_WINDOW_BACKEND = os.environ.get("VDN_WINDOW_BACKEND", "sdpa").lower()
+_WINDOW_BACKENDS = ("sdpa", "aiter", "aiter_ck", "aiter_fp8")
+_WINDOW_BACKEND = "sdpa"  # set by set_window_backend() at load, before modules attach
 _AITER_VARLEN = None  # resolved lazily; set to False after a failed import
 _AITER_FP8_VARLEN = None  # (xfuser::aiter_fp8_varlen, hadamard) set by prepare_window_backend
 _AITER_FP8_LOGGED = False
@@ -315,11 +314,24 @@ def _ensure_aiter_ck_op():
     return _AITER_CK_OP
 
 
+def set_window_backend(name: str) -> None:
+    """Select the window varlen kernel (one of ``_WINDOW_BACKENDS``).
+
+    Called once per load, before the VDN modules are attached. The runner derives
+    ``name`` from ``--attention_backend`` or the ``--vdn_window_backend`` override.
+    """
+    global _WINDOW_BACKEND
+    backend = name.lower()
+    if backend == "ck":
+        backend = "aiter_ck"
+    if backend not in _WINDOW_BACKENDS:
+        raise ValueError(f"VDN window backend {name!r} is not one of {', '.join(_WINDOW_BACKENDS)}.")
+    _WINDOW_BACKEND = backend
+
+
 def prepare_window_backend() -> None:
-    """Resolve ``VDN_WINDOW_BACKEND`` before the compiled forward runs."""
-    global _WINDOW_BACKEND, _AITER_CK_LOGGED
-    if _WINDOW_BACKEND == "ck":
-        _WINDOW_BACKEND = "aiter_ck"
+    """Register the selected window backend's op(s) before the compiled forward runs."""
+    global _AITER_CK_LOGGED
     if _WINDOW_BACKEND == "aiter_fp8":
         _ensure_aiter_fp8_parts()
     if _WINDOW_BACKEND != "aiter_ck":
