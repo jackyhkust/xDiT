@@ -1,0 +1,483 @@
+"""Real-time MPEG-TS streamer for generated chunks.
+
+Reads ``chunk_*.npz`` files from a stream directory in order, stitches them into
+one continuous timeline (``ChunkStitcher``), and plays that timeline out at a
+fixed frame rate. It encodes once (H.264 + AAC in MPEG-TS) and fans the bytes
+out to every HTTP client::
+
+    python -m xfuser.streaming.ts_server --stream_dir /dev/shm/h3_stream --port 20123
+    vlc http://<host>:20123/stream.ts
+
+The playout clock never waits for the generator. Until the first chunks arrive
+it shows the anchor image. When the buffer runs dry it repeats the last frame
+with silence and counts each one in ``stall_frames``; a sustained real-time
+stream keeps that at 0. ``GET /stats`` reports buffer depth, stalls, generation
+times and drift metrics.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import queue
+import signal
+import threading
+import time
+from fractions import Fraction
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import numpy as np
+
+from xfuser.logger import init_logger
+from xfuser.streaming.chunks import read_chunk, read_done, reset_stream_dir, write_played
+from xfuser.streaming.drift import chunk_metrics
+from xfuser.streaming.stitch import ChunkStitcher
+
+logger = init_logger(__name__)
+
+TS_PACKET_SIZE = 188
+
+
+class FanOut:
+    """File-like sink for the muxer that copies the byte stream to every client.
+
+    Bytes are batched per frame (``flush_frame``) so each client queue entry is
+    one frame's worth of TS packets. A client that falls ``max_queued_frames``
+    behind is dropped rather than allowed to block the encoder.
+    """
+
+    def __init__(self, max_queued_frames: int, record_path: Path | None = None) -> None:
+        self.max_queued_frames = max_queued_frames
+        self._pending = bytearray()
+        self._clients: set[queue.Queue] = set()
+        self._lock = threading.Lock()
+        self._bytes_written = 0
+        self._record = open(record_path, "wb") if record_path else None
+
+    def write(self, data) -> int:
+        self._pending += data
+        return len(data)
+
+    def flush_frame(self) -> None:
+        if not self._pending:
+            return
+        data = bytes(self._pending)
+        self._pending.clear()
+        if self._record:
+            self._record.write(data)
+        with self._lock:
+            for client in list(self._clients):
+                try:
+                    client.put_nowait(data)
+                except queue.Full:
+                    logger.warning("Dropping a client that fell behind the live stream.")
+                    self._clients.discard(client)
+                    with client.mutex:
+                        client.queue.clear()
+                    client.put_nowait(None)
+            self._bytes_written += len(data)
+
+    def add_client(self) -> tuple[queue.Queue, int]:
+        """Register a client; also return how many bytes to skip to reach a TS packet boundary."""
+        client: queue.Queue = queue.Queue(maxsize=self.max_queued_frames)
+        with self._lock:
+            self._clients.add(client)
+            skip = -self._bytes_written % TS_PACKET_SIZE
+        return client, skip
+
+    def remove_client(self, client: queue.Queue) -> None:
+        with self._lock:
+            self._clients.discard(client)
+
+    @property
+    def num_clients(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+    def close(self) -> None:
+        with self._lock:
+            for client in self._clients:
+                try:
+                    client.put_nowait(None)
+                except queue.Full:
+                    pass
+            self._clients.clear()
+        if self._record:
+            self._record.close()
+
+
+class AudioBuffer:
+    def __init__(self, channels: int) -> None:
+        self.channels = channels
+        self._pieces: collections.deque[np.ndarray] = collections.deque()
+        self.available = 0
+
+    def append(self, samples: np.ndarray) -> None:
+        if len(samples):
+            self._pieces.append(samples)
+            self.available += len(samples)
+
+    def read(self, count: int) -> np.ndarray:
+        """Exactly ``count`` samples, zero-padded if the buffer runs short."""
+        out = np.zeros((count, self.channels), dtype=np.float32)
+        filled = 0
+        while filled < count and self._pieces:
+            piece = self._pieces[0]
+            take = min(count - filled, len(piece))
+            out[filled : filled + take] = piece[:take]
+            filled += take
+            if take == len(piece):
+                self._pieces.popleft()
+            else:
+                self._pieces[0] = piece[take:]
+        self.available -= filled
+        return out
+
+
+def load_still(path: str | None, width: int, height: int) -> np.ndarray:
+    if not path:
+        return np.zeros((height, width, 3), dtype=np.uint8)
+    from PIL import Image
+
+    image = Image.open(path).convert("RGB")
+    if image.size != (width, height):
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return np.asarray(image)
+
+
+class Streamer:
+    def __init__(
+        self,
+        stream_dir: Path,
+        width: int,
+        height: int,
+        fps: int = 24,
+        sample_rate: int = 32000,
+        channels: int = 2,
+        anchor_image: str | None = None,
+        preroll_chunks: int = 1,
+        delete_chunks: bool = True,
+        metrics_path: Path | None = None,
+        record_path: Path | None = None,
+        crf: int = 18,
+        preset: str = "veryfast",
+        gop: int | None = None,
+        audio_bitrate: int = 192_000,
+        max_client_lag_s: float = 10.0,
+    ) -> None:
+        self.stream_dir = Path(stream_dir)
+        self.width, self.height = width, height
+        self.fps = fps
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.preroll_chunks = preroll_chunks
+        self.delete_chunks = delete_chunks
+        self.metrics_path = Path(metrics_path) if metrics_path else None
+        self.crf, self.preset, self.gop = crf, preset, gop or fps
+        self.audio_bitrate = audio_bitrate
+
+        self.anchor = load_still(anchor_image, width, height)
+        self.sink = FanOut(max_queued_frames=int(max_client_lag_s * fps), record_path=record_path)
+        self.stitcher = ChunkStitcher(fps, sample_rate, channels)
+
+        self._lock = threading.Lock()
+        self._frames: collections.deque[tuple[np.ndarray, int | None]] = collections.deque()
+        self._audio = AudioBuffer(channels)
+        self._stop = threading.Event()
+        self.finished = threading.Event()
+
+        self.started = False
+        self.frames_emitted = 0
+        self.content_frames = 0
+        self.stall_frames = 0
+        self.chunks_loaded = 0
+        self.chunks_played = 0
+        self.max_lag_s = 0.0
+        self.end_of_stream = False
+        self.recent_chunks: collections.deque[dict] = collections.deque(maxlen=16)
+
+    # Loader: chunk files -> stitched frame/audio buffers
+    def _load_loop(self) -> None:
+        index = 0
+        previous_last = None
+        while not self._stop.is_set():
+            chunk = read_chunk(self.stream_dir, index, delete=self.delete_chunks)
+            if chunk is None:
+                done = read_done(self.stream_dir)
+                if done is not None and index >= done:
+                    with self._lock:
+                        self.end_of_stream = True
+                    return
+                time.sleep(0.02)
+                continue
+            if chunk.fps != self.fps or chunk.sample_rate != self.sample_rate:
+                raise ValueError(
+                    f"Chunk {index} is {chunk.fps} fps / {chunk.sample_rate} Hz; "
+                    f"the stream is {self.fps} fps / {self.sample_rate} Hz."
+                )
+            if chunk.frames.shape[1:3] != (self.height, self.width):
+                raise ValueError(
+                    f"Chunk {index} frames are {chunk.frames.shape[2]}x{chunk.frames.shape[1]}; "
+                    f"the stream is {self.width}x{self.height}."
+                )
+            record = {
+                "index": index,
+                **chunk.meta,
+                **chunk_metrics(chunk.frames, self.anchor, previous_last),
+            }
+            previous_last = chunk.frames[-1]
+            with self._lock:
+                frames, audio = self.stitcher.push(chunk.frames, chunk.audio)
+                for position, frame in enumerate(frames):
+                    self._frames.append((frame, index if position == len(frames) - 1 else None))
+                self._audio.append(audio)
+                self.chunks_loaded += 1
+                record["buffered_s"] = round(len(self._frames) / self.fps, 3)
+                self.recent_chunks.append(record)
+            logger.info(
+                f"chunk {index}: gen {chunk.meta.get('gen_time_s', float('nan')):.2f}s, "
+                f"buffered {record['buffered_s']:.2f}s, seam PSNR {record.get('seam_psnr', float('nan')):.1f} dB"
+            )
+            if self.metrics_path:
+                with open(self.metrics_path, "a") as handle:
+                    handle.write(json.dumps(record) + "\n")
+            index += 1
+
+    # Playout clock: one frame every 1/fps seconds, whether or not content is ready
+    def _next_frame(self, last_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
+        samples_per_frame = round((self.frames_emitted + 1) * self.sample_rate / self.fps) - round(
+            self.frames_emitted * self.sample_rate / self.fps
+        )
+        with self._lock:
+            if not self.started and self.chunks_loaded > 0:
+                self.started = self.chunks_loaded >= self.preroll_chunks or self.end_of_stream
+            if self.started and self._frames:
+                frame, finished_chunk = self._frames.popleft()
+                content_samples = round((self.content_frames + 1) * self.sample_rate / self.fps) - round(
+                    self.content_frames * self.sample_rate / self.fps
+                )
+                if self._audio.available < content_samples:
+                    # The next chunk is late; release the held-back seam audio now.
+                    self._audio.append(self.stitcher.flush())
+                audio = self._audio.read(content_samples)
+                self.content_frames += 1
+                if finished_chunk is not None:
+                    self.chunks_played = finished_chunk + 1
+                    write_played(self.stream_dir, self.chunks_played)
+                return frame, audio, True
+            if self.started and not self.end_of_stream:
+                self.stall_frames += 1
+                if self.stall_frames == 1 or self.stall_frames % self.fps == 0:
+                    logger.warning(f"Underrun: repeating the last frame ({self.stall_frames} stall frames so far).")
+            elif self.end_of_stream and self.started:
+                self.finished.set()
+        still = last_frame if self.started else self.anchor
+        return still, np.zeros((samples_per_frame, self.channels), dtype=np.float32), False
+
+    def _open_container(self):
+        import av
+
+        container = av.open(self.sink, mode="w", format="mpegts")
+        video = container.add_stream("libx264", rate=self.fps)
+        video.width, video.height = self.width, self.height
+        video.pix_fmt = "yuv420p"
+        video.time_base = Fraction(1, self.fps)
+        video.options = {
+            "preset": self.preset,
+            "tune": "zerolatency",
+            "crf": str(self.crf),
+            "g": str(self.gop),
+            "keyint_min": str(self.gop),
+            "sc_threshold": "0",
+            "x264-params": "repeat-headers=1",
+        }
+        audio = container.add_stream("aac", rate=self.sample_rate)
+        audio.layout = "stereo" if self.channels == 2 else "mono"
+        audio.bit_rate = self.audio_bitrate
+        return av, container, video, audio
+
+    def _play_loop(self) -> None:
+        av, container, video_stream, audio_stream = self._open_container()
+        fifo = av.AudioFifo()
+        layout = "stereo" if self.channels == 2 else "mono"
+        audio_pts = 0
+        last_frame = self.anchor
+        start = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                lag = time.monotonic() - (start + self.frames_emitted / self.fps)
+                if lag < 0:
+                    time.sleep(-lag)
+                else:
+                    self.max_lag_s = max(self.max_lag_s, lag)
+
+                frame, samples, _ = self._next_frame(last_frame)
+                last_frame = frame
+
+                video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+                video_frame.pts = self.frames_emitted
+                for packet in video_stream.encode(video_frame):
+                    container.mux(packet)
+
+                audio_frame = av.AudioFrame.from_ndarray(
+                    np.ascontiguousarray(samples).reshape(1, -1), format="flt", layout=layout
+                )
+                audio_frame.sample_rate = self.sample_rate
+                fifo.write(audio_frame)
+                while fifo.samples >= 1024:
+                    block = fifo.read(1024)
+                    block.pts = audio_pts
+                    block.time_base = Fraction(1, self.sample_rate)
+                    audio_pts += block.samples
+                    for packet in audio_stream.encode(block):
+                        container.mux(packet)
+
+                self.frames_emitted += 1
+                self.sink.flush_frame()
+                if self.finished.is_set():
+                    break
+        finally:
+            for packet in video_stream.encode():
+                container.mux(packet)
+            for packet in audio_stream.encode():
+                container.mux(packet)
+            container.close()
+            self.sink.flush_frame()
+            self.sink.close()
+            self.finished.set()
+            logger.info(f"Playout stopped: {self.summary()}")
+
+    def summary(self) -> dict:
+        with self._lock:
+            return {
+                "started": self.started,
+                "end_of_stream": self.end_of_stream,
+                "frames_emitted": self.frames_emitted,
+                "content_frames": self.content_frames,
+                "stall_frames": self.stall_frames,
+                "chunks_loaded": self.chunks_loaded,
+                "chunks_played": self.chunks_played,
+                "buffered_s": round(len(self._frames) / self.fps, 3),
+                "max_clock_lag_s": round(self.max_lag_s, 4),
+                "clients": self.sink.num_clients,
+                "recent_chunks": list(self.recent_chunks),
+            }
+
+    def start(self) -> None:
+        self._threads = [
+            threading.Thread(target=self._load_loop, name="chunk-loader", daemon=True),
+            threading.Thread(target=self._play_loop, name="playout", daemon=True),
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        for thread in self._threads:
+            thread.join(timeout=5)
+
+
+def make_handler(streamer: Streamer):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path in ("/", "/stream.ts"):
+                self._stream()
+            elif path == "/stats":
+                body = json.dumps(streamer.summary(), indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(404)
+
+        def _stream(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            client, skip = streamer.sink.add_client()
+            logger.info(f"Client {self.client_address[0]} connected.")
+            try:
+                while True:
+                    data = client.get()
+                    if data is None:
+                        break
+                    if skip:
+                        data, skip = data[skip:], max(0, skip - len(data))
+                    self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                streamer.sink.remove_client(client)
+                logger.info(f"Client {self.client_address[0]} disconnected.")
+
+        def log_message(self, format, *args):
+            logger.debug(format % args)
+
+    return Handler
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description="Stream generated chunks as live MPEG-TS over HTTP.")
+    parser.add_argument("--stream_dir", type=Path, default=Path("/dev/shm/h3_stream"))
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=20123)
+    parser.add_argument("--width", type=int, default=960)
+    parser.add_argument("--height", type=int, default=544)
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--sample_rate", type=int, default=32000)
+    parser.add_argument("--anchor_image", default=None, help="Shown until the first chunk arrives.")
+    parser.add_argument("--preroll_chunks", type=int, default=1, help="Chunks to buffer before playback starts.")
+    parser.add_argument("--keep_chunks", action="store_true", help="Do not delete chunk files after loading.")
+    parser.add_argument("--metrics_path", type=Path, default=None, help="Append per-chunk metrics as JSONL.")
+    parser.add_argument("--record", type=Path, default=None, help="Also write the TS stream to this file.")
+    parser.add_argument("--crf", type=int, default=18)
+    parser.add_argument("--preset", default="veryfast")
+    parser.add_argument("--exit_when_done", action="store_true", help="Exit after the generator's last chunk plays.")
+    args = parser.parse_args(argv)
+
+    reset_stream_dir(args.stream_dir)
+    if args.metrics_path and args.metrics_path.exists():
+        args.metrics_path.unlink()
+    streamer = Streamer(
+        stream_dir=args.stream_dir,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        sample_rate=args.sample_rate,
+        anchor_image=args.anchor_image,
+        preroll_chunks=args.preroll_chunks,
+        delete_chunks=not args.keep_chunks,
+        metrics_path=args.metrics_path,
+        record_path=args.record,
+        crf=args.crf,
+        preset=args.preset,
+    )
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(streamer))
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, name="http", daemon=True).start()
+    streamer.start()
+    logger.info(f"Streaming http://{args.host}:{args.port}/stream.ts (stats at /stats), reading {args.stream_dir}")
+
+    def shutdown(*_):
+        streamer._stop.set()
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    while not streamer._stop.is_set():
+        if args.exit_when_done and streamer.finished.is_set():
+            break
+        time.sleep(0.2)
+    streamer.stop()
+    server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
