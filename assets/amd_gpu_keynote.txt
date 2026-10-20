@@ -1,0 +1,5 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] On a keynote stage lit by glowing green data-center server racks, a presenter with short silver hair, glasses, a lavender blazer and black trousers holds an AMD Instinct GPU chip high in her right hand and smiles at the audience. She turns the chip toward the camera and says, "This is AMD Instinct, built for AI at scale." Streams of green light pulse through the racks behind her. Steady medium shot with a slow push-in.
+overall_soundscape: Clear keynote voice, audience applause, soft data-center hum
+non_diegetic_music: Uplifting modern tech keynote music

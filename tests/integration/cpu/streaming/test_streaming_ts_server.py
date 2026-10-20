@@ -19,8 +19,9 @@ WIDTH, HEIGHT = 96, 64
 CHUNK_FRAMES = 22  # 17 * 1 + 5, the shortest length the H3 VAE decodes
 
 
-def _chunk(index: int) -> Chunk:
-    frames = np.full((CHUNK_FRAMES, HEIGHT, WIDTH, 3), 40 + 60 * index, dtype=np.uint8)
+def _chunk(index: int, level: int | None = None) -> Chunk:
+    level = 40 + 60 * index if level is None else level
+    frames = np.full((CHUNK_FRAMES, HEIGHT, WIDTH, 3), level, dtype=np.uint8)
     samples = round(CHUNK_FRAMES * SAMPLE_RATE / FPS) + 267
     tone = 0.2 * np.sin(np.arange(samples) * 2 * np.pi * 440 / SAMPLE_RATE, dtype=np.float32)
     return Chunk(
@@ -140,6 +141,67 @@ def test_an_underrun_repeats_frames_without_breaking_timestamps(serve, tmp_path)
     assert summary["content_frames"] == 2 * CHUNK_FRAMES - 1
     recorded, _ = _decode((tmp_path / "record.ts").read_bytes())
     _assert_continuous_24fps([t for t, _ in recorded])
+
+
+def test_a_cut_drops_buffered_frames_and_the_next_chunk_continues_from_the_cut(serve, tmp_path):
+    from xfuser.streaming.chunks import read_position, write_cut
+
+    stream = tmp_path / "stream"
+    for index in range(4):
+        write_chunk(stream, _chunk(index))
+    streamer, _ = serve()
+    deadline = time.monotonic() + 15
+    while streamer.summary()["chunks_loaded"] < 4 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    keep_through = 30
+    write_cut(stream, epoch=1, keep_through=keep_through, after_chunk=3, prompt_id=1)
+    while not streamer.summary()["cuts"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    write_chunk(stream, _chunk(4, level=10))
+    mark_done(stream, 5)
+    assert streamer.finished.wait(timeout=30)
+
+    summary = streamer.summary()
+    assert summary["cuts"][0]["late_frames"] == 0
+    assert summary["cuts"][0]["dropped_s"] > 1.0
+    assert summary["stall_frames"] == 0
+    assert summary["chunks_played"] == 5
+    assert summary["content_frames"] == keep_through + 1 + CHUNK_FRAMES - 1
+    assert read_position(stream) == summary["content_frames"]
+
+    recorded, _ = _decode((tmp_path / "record.ts").read_bytes())
+    _assert_continuous_24fps([t for t, _ in recorded])
+    levels = [level for _, level in recorded]
+    assert levels[-1] == pytest.approx(10, abs=4)
+    # Frame 30 sits in chunk 1 (frames 22-42), so chunks 2 and 3 never play.
+    assert not any(abs(level - 160) <= 4 or abs(level - 220) <= 4 for level in levels)
+
+
+def test_the_overlay_switch_turns_the_overlay_on_mid_stream(serve, tmp_path):
+    from xfuser.streaming.prompt_queue import read_overlay, toggle_overlay
+
+    stream = tmp_path / "stream"
+    for index in range(4):
+        write_chunk(stream, _chunk(index, level=200))
+    mark_done(stream, 4)
+    streamer, _ = serve()
+    assert read_overlay(stream) is False
+
+    deadline = time.monotonic() + 15
+    while streamer.summary()["content_frames"] < 12 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert toggle_overlay(stream) is True
+    assert streamer.finished.wait(timeout=30)
+    assert streamer.summary()["overlay"] is True
+
+    container = av.open(str(tmp_path / "record.ts"), format="mpegts")
+    # A pixel inside the panel's padding: plain frame level before, darkened by the panel after.
+    corner = [int(frame.to_ndarray(format="rgb24")[13, 13, 0]) for frame in container.decode(video=0)]
+    container.close()
+    # The first emitted frames can be lead-in black, so look at the start of the content.
+    assert max(corner[:10]) == pytest.approx(200, abs=12)
+    assert corner[-1] < 140
 
 
 def test_a_client_joining_mid_stream_decodes_within_one_gop(serve, tmp_path):

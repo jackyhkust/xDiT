@@ -13,6 +13,11 @@ it shows the anchor image. When the buffer runs dry it repeats the last frame
 with silence and counts each one in ``stall_frames``; a sustained real-time
 stream keeps that at 0. ``GET /stats`` reports buffer depth, stalls, generation
 times and drift metrics.
+
+When the generator writes a cut marker for a new prompt, the buffered frames
+after the cut frame are dropped and the next chunk continues from it. The
+streamer publishes its exact playback position (content frames played) so the
+generator can pick that cut frame.
 """
 
 from __future__ import annotations
@@ -31,8 +36,24 @@ from pathlib import Path
 import numpy as np
 
 from xfuser.logger import init_logger
-from xfuser.streaming.chunks import read_chunk, read_done, reset_stream_dir, write_played
+from xfuser.streaming.chunks import (
+    read_chunk,
+    read_cut,
+    read_done,
+    reset_stream_dir,
+    write_played,
+    write_position,
+)
 from xfuser.streaming.drift import chunk_metrics
+from xfuser.streaming.overlay import Overlay
+from xfuser.streaming.prompt_queue import (
+    latest_prompt,
+    read_new_prompts,
+    read_overlay,
+    read_prompt_state,
+    write_overlay,
+)
+from xfuser.streaming.resolution import cover_resize
 from xfuser.streaming.stitch import ChunkStitcher
 
 logger = init_logger(__name__)
@@ -135,16 +156,31 @@ class AudioBuffer:
         self.available -= filled
         return out
 
+    def truncate(self, keep: int, fade: int = 0) -> None:
+        """Keep only the first ``keep`` samples, fading out the last ``fade`` of them."""
+        kept: collections.deque[np.ndarray] = collections.deque()
+        total = 0
+        for piece in self._pieces:
+            if total >= keep:
+                break
+            piece = piece[: keep - total]
+            kept.append(piece)
+            total += len(piece)
+        self._pieces = kept
+        self.available = total
+        fade = min(fade, total)
+        if fade and kept:
+            tail = np.concatenate(list(kept), axis=0)
+            tail[total - fade :] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)[:, None]
+            self._pieces = collections.deque([tail])
+
 
 def load_still(path: str | None, width: int, height: int) -> np.ndarray:
     if not path:
         return np.zeros((height, width, 3), dtype=np.uint8)
     from PIL import Image
 
-    image = Image.open(path).convert("RGB")
-    if image.size != (width, height):
-        image = image.resize((width, height), Image.Resampling.LANCZOS)
-    return np.asarray(image)
+    return np.asarray(cover_resize(Image.open(path).convert("RGB"), (width, height)))
 
 
 class Streamer:
@@ -161,11 +197,13 @@ class Streamer:
         delete_chunks: bool = True,
         metrics_path: Path | None = None,
         record_path: Path | None = None,
-        crf: int = 18,
+        crf: int = 23,
+        max_kbps: int = 3000,
         preset: str = "veryfast",
         gop: int | None = None,
         audio_bitrate: int = 192_000,
         max_client_lag_s: float = 10.0,
+        overlay: bool = False,
     ) -> None:
         self.stream_dir = Path(stream_dir)
         self.width, self.height = width, height
@@ -176,14 +214,25 @@ class Streamer:
         self.delete_chunks = delete_chunks
         self.metrics_path = Path(metrics_path) if metrics_path else None
         self.crf, self.preset, self.gop = crf, preset, gop or fps
+        self.max_kbps = max_kbps
         self.audio_bitrate = audio_bitrate
 
         self.anchor = load_still(anchor_image, width, height)
         self.sink = FanOut(max_queued_frames=int(max_client_lag_s * fps), record_path=record_path)
         self.stitcher = ChunkStitcher(fps, sample_rate, channels)
 
+        self.overlay = Overlay(fps)
+        self.overlay_enabled = overlay
+        write_overlay(self.stream_dir, overlay)
+        self._latest_input = ""
+        self._prompt_state: dict | None = None
+        self._controls_ts = 0.0
+        self._chunk_prompt_id: dict[int, int] = {}
+        self.played_prompt_id = 0
+
         self._lock = threading.Lock()
-        self._frames: collections.deque[tuple[np.ndarray, int | None]] = collections.deque()
+        # (frame, chunk index if this is the chunk's last frame, chunk index if its first)
+        self._frames: collections.deque[tuple[np.ndarray, int | None, int | None]] = collections.deque()
         self._audio = AudioBuffer(channels)
         self._stop = threading.Event()
         self.finished = threading.Event()
@@ -197,12 +246,60 @@ class Streamer:
         self.max_lag_s = 0.0
         self.end_of_stream = False
         self.recent_chunks: collections.deque[dict] = collections.deque(maxlen=16)
+        self.cut_epoch = 0
+        self.cuts: collections.deque[dict] = collections.deque(maxlen=16)
+        self.prompt_latencies: dict[int, float] = {}
+
+    def _apply_cut(self, cut: dict) -> np.ndarray | None:
+        """Drop buffered frames after ``cut['keep_through']``; return the new last buffered frame."""
+        with self._lock:
+            keep = max(0, cut["keep_through"] + 1 - self.content_frames)
+            dropped = max(0, len(self._frames) - keep)
+            late = cut["keep_through"] + 1 - self.content_frames < 0
+            while len(self._frames) > keep:
+                self._frames.pop()
+            if self._frames:
+                frame, _, started = self._frames[-1]
+                self._frames[-1] = (frame, cut["after_chunk"], started)
+            else:
+                self.chunks_played = cut["after_chunk"] + 1
+                write_played(self.stream_dir, self.chunks_played)
+            boundary = lambda j: round(j * self.sample_rate / self.fps)  # noqa: E731
+            keep_samples = boundary(self.content_frames + keep) - boundary(self.content_frames)
+            fade = boundary(self.content_frames + keep) - boundary(self.content_frames + max(0, keep - 1))
+            self._audio.truncate(keep_samples, fade=fade)
+            self.stitcher.rewind(self.content_frames + keep)
+            self.cut_epoch = cut["epoch"]
+            record = {
+                "epoch": cut["epoch"],
+                "prompt_id": cut.get("prompt_id"),
+                "keep_through": cut["keep_through"],
+                "played_at_cut": self.content_frames,
+                "dropped_s": round(dropped / self.fps, 3),
+                "late_frames": max(0, self.content_frames - cut["keep_through"] - 1),
+            }
+            self.cuts.append(record)
+            last = self._frames[-1][0] if self._frames else None
+        message = (
+            f"Cut-in for prompt #{record['prompt_id']}: keeping frames through {cut['keep_through']} "
+            f"({keep / self.fps:.2f}s left to play), dropped {record['dropped_s']:.2f}s of buffered video."
+        )
+        if late:
+            logger.warning(f"{message} The cut arrived {record['late_frames']} frames late.")
+        else:
+            logger.info(message)
+        return last
 
     # Loader: chunk files -> stitched frame/audio buffers
     def _load_loop(self) -> None:
         index = 0
         previous_last = None
         while not self._stop.is_set():
+            cut = read_cut(self.stream_dir)
+            if cut is not None and cut["epoch"] > self.cut_epoch and index > cut["after_chunk"]:
+                last = self._apply_cut(cut)
+                if last is not None:
+                    previous_last = last
             chunk = read_chunk(self.stream_dir, index, delete=self.delete_chunks)
             if chunk is None:
                 done = read_done(self.stream_dir)
@@ -228,10 +325,17 @@ class Streamer:
                 **chunk_metrics(chunk.frames, self.anchor, previous_last),
             }
             previous_last = chunk.frames[-1]
+            self._chunk_prompt_id[index] = int(chunk.meta.get("prompt_id", 0))
             with self._lock:
                 frames, audio = self.stitcher.push(chunk.frames, chunk.audio)
                 for position, frame in enumerate(frames):
-                    self._frames.append((frame, index if position == len(frames) - 1 else None))
+                    self._frames.append(
+                        (
+                            frame,
+                            index if position == len(frames) - 1 else None,
+                            index if position == 0 else None,
+                        )
+                    )
                 self._audio.append(audio)
                 self.chunks_loaded += 1
                 record["buffered_s"] = round(len(self._frames) / self.fps, 3)
@@ -254,7 +358,9 @@ class Streamer:
             if not self.started and self.chunks_loaded > 0:
                 self.started = self.chunks_loaded >= self.preroll_chunks or self.end_of_stream
             if self.started and self._frames:
-                frame, finished_chunk = self._frames.popleft()
+                frame, finished_chunk, started_chunk = self._frames.popleft()
+                if started_chunk is not None:
+                    self._on_chunk_start(started_chunk)
                 content_samples = round((self.content_frames + 1) * self.sample_rate / self.fps) - round(
                     self.content_frames * self.sample_rate / self.fps
                 )
@@ -263,6 +369,7 @@ class Streamer:
                     self._audio.append(self.stitcher.flush())
                 audio = self._audio.read(content_samples)
                 self.content_frames += 1
+                write_position(self.stream_dir, self.content_frames)
                 if finished_chunk is not None:
                     self.chunks_played = finished_chunk + 1
                     write_played(self.stream_dir, self.chunks_played)
@@ -275,6 +382,37 @@ class Streamer:
                 self.finished.set()
         still = last_frame if self.started else self.anchor
         return still, np.zeros((samples_per_frame, self.channels), dtype=np.float32), False
+
+    def _on_chunk_start(self, index: int) -> None:
+        """A chunk's first frame is going on screen; log when a viewer prompt first becomes visible."""
+        prompt_id = self._chunk_prompt_id.pop(index, 0)
+        if prompt_id <= self.played_prompt_id:
+            return
+        self.played_prompt_id = prompt_id
+        typed = read_new_prompts(self.stream_dir, prompt_id - 1)
+        if typed and typed[0].id == prompt_id:
+            latency = time.time() - typed[0].ts
+            self.prompt_latencies[prompt_id] = round(latency, 2)
+            logger.info(f"Prompt #{prompt_id} on screen {latency:.1f}s after it was typed.")
+
+    def _poll_controls(self) -> None:
+        """Every 0.5 s, re-read the overlay switch, the latest typed prompt and the prompt state."""
+        now = time.monotonic()
+        if now - self._controls_ts < 0.5:
+            return
+        self._controls_ts = now
+        enabled = read_overlay(self.stream_dir)
+        if enabled is not None and enabled != self.overlay_enabled:
+            self.overlay_enabled = enabled
+            logger.info(f"Overlay {'on' if enabled else 'off'}.")
+        latest = latest_prompt(self.stream_dir)
+        self._latest_input = latest.text if latest else ""
+        self._prompt_state = read_prompt_state(self.stream_dir)
+
+    def _apply_overlay(self, frame: np.ndarray) -> np.ndarray:
+        with self._lock:
+            buffered = len(self._frames)
+        return self.overlay.render(frame, buffered_frames=buffered, user_text=self._latest_input)
 
     def _open_container(self):
         import av
@@ -293,6 +431,10 @@ class Streamer:
             "sc_threshold": "0",
             "x264-params": "repeat-headers=1",
         }
+        if self.max_kbps:
+            # Capped CRF: keeps quality-driven rate control but clips scene-change
+            # spikes that would make a thin link (e.g. an SSH tunnel) fall behind.
+            video.options |= {"maxrate": f"{self.max_kbps}k", "bufsize": f"{self.max_kbps}k"}
         audio = container.add_stream("aac", rate=self.sample_rate)
         audio.layout = "stereo" if self.channels == 2 else "mono"
         audio.bit_rate = self.audio_bitrate
@@ -315,6 +457,9 @@ class Streamer:
 
                 frame, samples, _ = self._next_frame(last_frame)
                 last_frame = frame
+                self._poll_controls()
+                if self.overlay_enabled:
+                    frame = self._apply_overlay(frame)
 
                 video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
                 video_frame.pts = self.frames_emitted
@@ -359,6 +504,11 @@ class Streamer:
                 "stall_frames": self.stall_frames,
                 "chunks_loaded": self.chunks_loaded,
                 "chunks_played": self.chunks_played,
+                "played_prompt_id": self.played_prompt_id,
+                "prompt_latencies_s": dict(self.prompt_latencies),
+                "cuts": list(self.cuts),
+                "prompt_state": self._prompt_state,
+                "overlay": self.overlay_enabled,
                 "buffered_s": round(len(self._frames) / self.fps, 3),
                 "max_clock_lag_s": round(self.max_lag_s, 4),
                 "clients": self.sink.num_clients,
@@ -438,9 +588,21 @@ def main(argv=None) -> None:
     parser.add_argument("--keep_chunks", action="store_true", help="Do not delete chunk files after loading.")
     parser.add_argument("--metrics_path", type=Path, default=None, help="Append per-chunk metrics as JSONL.")
     parser.add_argument("--record", type=Path, default=None, help="Also write the TS stream to this file.")
-    parser.add_argument("--crf", type=int, default=18)
+    parser.add_argument("--crf", type=int, default=23, help="x264 quality (lower is better and bigger).")
+    parser.add_argument(
+        "--max_kbps", type=int, default=3000, help="Peak video bitrate cap in kbit/s (0 disables the cap)."
+    )
     parser.add_argument("--preset", default="veryfast")
     parser.add_argument("--exit_when_done", action="store_true", help="Exit after the generator's last chunk plays.")
+    parser.add_argument(
+        "--overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Start with the overlay (buffered frames, latest input) on. "
+            "The prompt console's /overlay switches it at runtime."
+        ),
+    )
     args = parser.parse_args(argv)
 
     reset_stream_dir(args.stream_dir)
@@ -458,7 +620,9 @@ def main(argv=None) -> None:
         metrics_path=args.metrics_path,
         record_path=args.record,
         crf=args.crf,
+        max_kbps=args.max_kbps,
         preset=args.preset,
+        overlay=args.overlay,
     )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(streamer))
     server.daemon_threads = True

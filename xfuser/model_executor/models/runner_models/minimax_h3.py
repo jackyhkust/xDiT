@@ -261,7 +261,34 @@ def _mark_dynamic_timestep(timestep):
     mark(timestep, 0)
 
 
-def _wrap_compiled_forward(transformer, original_forward, compiled_forward):
+# (argument name, dim) pairs whose size follows the prompt's token count.
+_TEXT_LENGTH_DIMS = (
+    ("encoder_hidden_states", 1),
+    ("text_indices", 0),
+    ("position_ids", 0),
+    ("token_tags", 0),
+    ("timestep_indices", 0),
+)
+
+
+def _mark_dynamic_text_length(arguments) -> None:
+    """Compile one graph for every prompt length instead of recompiling per length.
+
+    A runtime prompt change alters the packed sequence length; with static shapes
+    each new length costs a full recompile. The sizes stay backed: the forward
+    checks these lengths against each other, which unbacked sizes cannot prove.
+    The pad cases that would still split the graph are removed by
+    ``min_pad_rows`` (see ``_compile_model``).
+    """
+    import torch._dynamo
+
+    for name, dim in _TEXT_LENGTH_DIMS:
+        tensor = arguments.get(name)
+        if isinstance(tensor, torch.Tensor) and tensor.dim() > dim:
+            torch._dynamo.maybe_mark_dynamic(tensor, dim)
+
+
+def _wrap_compiled_forward(transformer, original_forward, compiled_forward, dynamic_text_length=False):
     """Do everything that has to happen outside the compiled region.
 
     Two jobs, both of which would otherwise force a recompile or a graph break:
@@ -286,6 +313,8 @@ def _wrap_compiled_forward(transformer, original_forward, compiled_forward):
         timestep = bound.arguments.get("timestep")
         if isinstance(timestep, torch.Tensor) and timestep.dim() > 0:
             _mark_dynamic_timestep(timestep)
+        if dynamic_text_length:
+            _mark_dynamic_text_length(bound.arguments)
         if prime_vsa_h3:
             transformer.prepare_vsa_h3_metadata(
                 bound.arguments["position_ids"],
@@ -623,6 +652,9 @@ class xFuserMiniMaxH3Model(xFuserModel):
             return
         self._enable_compute_comm_overlap()
         transformer = getattr(self.pipe, self._transformer_component_name)
+        dynamic_text_length = getattr(self, "dynamic_text_length", False)
+        if dynamic_text_length:
+            transformer.min_pad_rows = 2
         use_hybrid = get_runtime_state().has_attention_schedule()
         original_forward = transformer.forward
         compiled_forward = torch.compile(
@@ -633,7 +665,12 @@ class xFuserMiniMaxH3Model(xFuserModel):
 
         # Marking the timestep dynamic fixes a recompile: it avoids more than
         # one graph realizing after compile-warmup.
-        transformer.forward = _wrap_compiled_forward(transformer, original_forward, compiled_forward)
+        transformer.forward = _wrap_compiled_forward(
+            transformer,
+            original_forward,
+            compiled_forward,
+            dynamic_text_length=dynamic_text_length,
+        )
         compile_args = copy.deepcopy(input_args)
         if not get_runtime_state().has_attention_schedule():
             compile_args["num_inference_steps"] = self._warmup_num_inference_steps

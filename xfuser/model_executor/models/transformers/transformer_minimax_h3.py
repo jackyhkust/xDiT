@@ -235,16 +235,23 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             lambda module, args: get_runtime_state().increment_step_counter()
         )
 
+    # Rows of padding always appended, at least. 0 pads only to the alignment.
+    # With a dynamic text length, 2 keeps every length in one compiled graph:
+    # a pad of 0 takes the early return below and a pad of 1 is a size-1 dim
+    # that contiguity checks special-case, and both split off a new graph.
+    min_pad_rows: int = 0
+
     @staticmethod
     def _pad_rows(
         hidden_states: torch.Tensor,
         timestep_indices: torch.Tensor,
         token_tags: torch.Tensor,
         position_ids: torch.Tensor,
+        min_pad: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         sequence_length = position_ids.shape[0]
         padded_length = (
-            (sequence_length + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
+            (sequence_length + min_pad + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
             // MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
             * MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
         )
@@ -450,6 +457,7 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             timestep_indices,
             token_tags,
             position_ids,
+            min_pad=self.min_pad_rows,
         )
 
         padded_length = padded_position_ids.shape[0]

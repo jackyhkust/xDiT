@@ -86,6 +86,16 @@ class ChunkStitcher:
         self.emitted_frames = end
         return frames[first_kept:], np.concatenate(pieces, axis=0)
 
+    def rewind(self, emitted_frames: int) -> None:
+        """Continue the timeline after frame ``emitted_frames - 1`` (a cut-in dropped the frames after it).
+
+        The held-back seam audio belonged to a dropped frame, so it is discarded and
+        the next chunk's audio fades in instead of being crossfaded.
+        """
+        self.emitted_frames = emitted_frames
+        self._tail = None
+        self._fade_in_next = True
+
     def flush(self) -> np.ndarray:
         """Release the held-back last-frame audio with a fade-out (use on underrun)."""
         if self._tail is None:

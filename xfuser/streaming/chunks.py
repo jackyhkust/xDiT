@@ -1,8 +1,10 @@
 """Chunk handoff between the generator and the streamer through a shared directory.
 
 Each chunk is one ``.npz`` file written atomically (tmp file, then rename) so the
-reader never sees a partial chunk. The streamer reports how many chunks it has
-played in a small text file, which the generator reads for backpressure.
+reader never sees a partial chunk. The streamer reports how many chunks and
+content frames it has played in small text files; the generator reads the frame
+position for backpressure and to pick where a new prompt cuts in. A cut marker
+(``cut.json``) tells the streamer to drop buffered frames past that point.
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ from pathlib import Path
 import numpy as np
 
 PLAYED_FILE = "played"
+POSITION_FILE = "position"
+CUT_FILE = "cut.json"
 DONE_FILE = "done"
 
 
@@ -85,6 +89,43 @@ def read_played(stream_dir: Path) -> int:
         return 0
 
 
+def write_position(stream_dir: Path, content_frames: int) -> None:
+    """Publish how many content frames the streamer has played (its exact playback position)."""
+    stream_dir = Path(stream_dir)
+    tmp_path = stream_dir / f"{POSITION_FILE}.tmp"
+    tmp_path.write_text(str(content_frames))
+    os.replace(tmp_path, stream_dir / POSITION_FILE)
+
+
+def read_position(stream_dir: Path) -> int:
+    try:
+        return int((Path(stream_dir) / POSITION_FILE).read_text())
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def write_cut(stream_dir: Path, epoch: int, keep_through: int, after_chunk: int, prompt_id: int) -> None:
+    """Ask the streamer to drop every buffered frame after global frame ``keep_through``.
+
+    The cut applies once chunk ``after_chunk`` has been loaded; the next chunk
+    continues the timeline from frame ``keep_through``. ``epoch`` increases with
+    every cut so the streamer applies each one exactly once.
+    """
+    stream_dir = Path(stream_dir)
+    tmp_path = stream_dir / f"{CUT_FILE}.tmp"
+    tmp_path.write_text(
+        json.dumps({"epoch": epoch, "keep_through": keep_through, "after_chunk": after_chunk, "prompt_id": prompt_id})
+    )
+    os.replace(tmp_path, stream_dir / CUT_FILE)
+
+
+def read_cut(stream_dir: Path) -> dict | None:
+    try:
+        return json.loads((Path(stream_dir) / CUT_FILE).read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
 def mark_done(stream_dir: Path, num_chunks: int) -> None:
     """Tell the streamer no chunk past ``num_chunks - 1`` is coming."""
     (Path(stream_dir) / DONE_FILE).write_text(str(num_chunks))
@@ -98,9 +139,12 @@ def read_done(stream_dir: Path) -> int | None:
 
 
 def reset_stream_dir(stream_dir: Path) -> None:
-    """Remove chunks and markers from a previous run."""
+    """Remove chunks, markers and interactive-prompt files from a previous run."""
+    from xfuser.streaming.prompt_queue import OVERLAY_FILE, PROMPT_STATE_FILE, PROMPTS_FILE
+
     stream_dir = Path(stream_dir)
     stream_dir.mkdir(parents=True, exist_ok=True)
+    stale = {PLAYED_FILE, POSITION_FILE, CUT_FILE, DONE_FILE, PROMPTS_FILE, PROMPT_STATE_FILE, OVERLAY_FILE}
     for path in stream_dir.iterdir():
-        if path.name.startswith("chunk_") or path.name in (PLAYED_FILE, DONE_FILE):
+        if path.name.startswith("chunk_") or path.name in stale:
             path.unlink()

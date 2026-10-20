@@ -204,6 +204,25 @@ def test_minimax_h3_padding_alignment():
     assert torch.all(padded[2][65:] == -1)
 
 
+@pytest.mark.parametrize("length, expected_pad", [(62, 2), (63, 65), (64, 64), (65, 63), (126, 2)])
+def test_minimax_h3_min_pad_never_leaves_a_pad_of_zero_or_one(length, expected_pad):
+    from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
+        xFuserMiniMaxH3Transformer3DWrapper,
+    )
+
+    padded = xFuserMiniMaxH3Transformer3DWrapper._pad_rows(
+        torch.randn(1, length, 8),
+        torch.zeros(length, dtype=torch.long),
+        torch.zeros(length, dtype=torch.long),
+        torch.zeros(length, 3),
+        min_pad=2,
+    )
+
+    assert padded[-1] == expected_pad
+    assert padded[3].shape[0] % 64 == 0
+    assert torch.all(padded[2][length:] == -1)
+
+
 def test_minimax_h3_publishes_the_trailing_pad_length(monkeypatch):
     """Backends without a key-padding mask slice K/V by valid_kv_len instead.
 
