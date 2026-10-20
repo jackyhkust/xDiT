@@ -1,6 +1,7 @@
 import io
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -202,6 +203,107 @@ def test_the_overlay_switch_turns_the_overlay_on_mid_stream(serve, tmp_path):
     # The first emitted frames can be lead-in black, so look at the start of the content.
     assert max(corner[:10]) == pytest.approx(200, abs=12)
     assert corner[-1] < 140
+
+
+def _read_mp4(url: str, into: io.BytesIO, headers: dict) -> threading.Thread:
+    def read():
+        with urllib.request.urlopen(f"{url}/stream.mp4", timeout=30) as response:
+            headers.update(response.headers)
+            while chunk := response.read(65536):
+                into.write(chunk)
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    return thread
+
+
+def _decode_mp4(data: bytes):
+    container = av.open(io.BytesIO(data), format="mp4")
+    video = container.streams.video[0]
+    times = [frame.pts * video.time_base for frame in container.decode(video=0)]
+    container.close()
+    container = av.open(io.BytesIO(data), format="mp4")
+    audio_samples = sum(frame.samples for frame in container.decode(audio=0))
+    container.close()
+    return times, audio_samples
+
+
+def _post(url: str, path: str, payload: dict | None = None):
+    import json
+
+    body = json.dumps(payload).encode() if payload is not None else b""
+    request = urllib.request.Request(f"{url}{path}", data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def test_the_web_page_plays_fragmented_mp4_and_takes_prompts(serve, tmp_path):
+    import json
+
+    from xfuser.streaming.prompt_queue import read_new_prompts, read_overlay
+
+    stream = tmp_path / "stream"
+    for index in range(3):
+        write_chunk(stream, _chunk(index))
+    streamer, url = serve()
+    received, headers = io.BytesIO(), {}
+    client = _read_mp4(url, received, headers)
+
+    with urllib.request.urlopen(f"{url}/", timeout=10) as response:
+        assert response.headers["Content-Type"].startswith("text/html")
+        assert b"stream.mp4" in response.read()
+    assert _post(url, "/api/prompt", {"prompt": "a robot waves"})["id"] == 1
+    assert _post(url, "/api/overlay") == {"overlay": True}
+    with pytest.raises(urllib.error.HTTPError) as error:
+        _post(url, "/api/prompt", {"prompt": ""})
+    assert error.value.code == 400
+    (prompt,) = read_new_prompts(stream, 0)
+    assert (prompt.text, prompt.source) == ("a robot waves", "web")
+    assert read_overlay(stream) is True
+
+    deadline = time.monotonic() + 10
+    while streamer.summary()["web_clients"] < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    with urllib.request.urlopen(f"{url}/api/status", timeout=10) as response:
+        status = json.loads(response.read())
+    assert status["video"] == {"width": WIDTH, "height": HEIGHT, "fps": FPS}
+    assert status["prompts"][0]["text"] == "a robot waves"
+    assert status["viewers"]["web"] == 1
+
+    mark_done(stream, 3)
+    assert streamer.finished.wait(timeout=30)
+    client.join(timeout=10)
+
+    assert headers["X-Codecs"].startswith("avc1.") and headers["X-Codecs"].endswith(",mp4a.40.2")
+    times, audio_samples = _decode_mp4(received.getvalue())
+    assert len(times) == streamer.summary()["frames_emitted"]
+    # The edit list for the AAC priming delay (1024 samples) moves every frame but the first.
+    _assert_continuous_24fps(times[1:])
+    assert abs(audio_samples / SAMPLE_RATE - len(times) / FPS) < 0.1
+
+
+def test_a_web_viewer_joining_mid_stream_starts_on_a_fragment(serve, tmp_path):
+    for index in range(4):
+        write_chunk(tmp_path / "stream", _chunk(index))
+    mark_done(tmp_path / "stream", 4)
+    streamer, url = serve()
+
+    deadline = time.monotonic() + 15
+    while streamer.summary()["frames_emitted"] < 30 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    joined_at = streamer.summary()["frames_emitted"]
+    received, headers = io.BytesIO(), {}
+    client = _read_mp4(url, received, headers)
+    assert streamer.finished.wait(timeout=30)
+    client.join(timeout=10)
+
+    times, _ = _decode_mp4(received.getvalue())
+    remaining = streamer.summary()["frames_emitted"] - joined_at
+    # A fragment is published when the next GOP starts, so the viewer gets the
+    # one in progress when it joined: it starts at most one GOP before joined_at.
+    assert remaining <= len(times) <= remaining + FPS
+    assert (joined_at - FPS) / FPS <= float(times[0]) <= joined_at / FPS + 0.05
+    _assert_continuous_24fps(times)
 
 
 def test_a_client_joining_mid_stream_decodes_within_one_gop(serve, tmp_path):

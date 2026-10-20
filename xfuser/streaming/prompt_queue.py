@@ -14,6 +14,7 @@ the CLI and the generator never contend on it.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
@@ -37,6 +38,8 @@ class UserPrompt:
     id: int
     text: str
     ts: float
+    # Who queued it: "console", "web" or "demo".
+    source: str = "console"
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -45,26 +48,23 @@ def _atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp_path, path)
 
 
-def append_prompt(stream_dir: Path, text: str) -> UserPrompt:
-    """Append one user prompt; its id is the 1-based line number in the file."""
+def append_prompt(stream_dir: Path, text: str, source: str = "console") -> UserPrompt:
+    """Append one user prompt; its id is the 1-based line number in the file.
+
+    The console, the demo loop and the web UI can append at the same time, so
+    counting and appending happen under an exclusive lock on the file.
+    """
     stream_dir = Path(stream_dir)
     stream_dir.mkdir(parents=True, exist_ok=True)
-    path = stream_dir / PROMPTS_FILE
-    next_id = _count_lines(path) + 1
-    prompt = UserPrompt(id=next_id, text=text.strip(), ts=time.time())
-    with open(path, "a") as handle:
+    with open(stream_dir / PROMPTS_FILE, "a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.seek(0)
+        next_id = sum(1 for line in handle if line.strip()) + 1
+        prompt = UserPrompt(id=next_id, text=text.strip(), ts=time.time(), source=source)
         handle.write(json.dumps(asdict(prompt)) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
     return prompt
-
-
-def _count_lines(path: Path) -> int:
-    try:
-        with open(path) as handle:
-            return sum(1 for line in handle if line.strip())
-    except FileNotFoundError:
-        return 0
 
 
 def read_new_prompts(stream_dir: Path, after_id: int) -> list[UserPrompt]:
@@ -82,7 +82,14 @@ def read_new_prompts(stream_dir: Path, after_id: int) -> list[UserPrompt]:
                 except json.JSONDecodeError:
                     continue
                 if record.get("id", 0) > after_id:
-                    prompts.append(UserPrompt(id=record["id"], text=record["text"], ts=record["ts"]))
+                    prompts.append(
+                        UserPrompt(
+                            id=record["id"],
+                            text=record["text"],
+                            ts=record["ts"],
+                            source=record.get("source", "console"),
+                        )
+                    )
     except FileNotFoundError:
         return []
     return prompts

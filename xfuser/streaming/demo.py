@@ -217,6 +217,6 @@ def run_demo(
         if time.time() - last < interval_s:
             continue
         with lock:
-            prompt = append_prompt(stream_dir, director.next_prompt())
+            prompt = append_prompt(stream_dir, director.next_prompt(), source="demo")
         if on_prompt is not None:
             on_prompt(prompt)

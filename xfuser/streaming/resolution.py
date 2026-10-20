@@ -4,7 +4,8 @@ MiniMax-H3 needs height and width divisible by 32 (16x VAE downsampling times
 a 2x2 patch). ``fit_resolution`` keeps roughly the requested pixel count, so a
 portrait anchor gets a portrait canvas at about the same generation cost.
 ``cover_resize`` scales an image to cover the canvas and center-crops the
-rest, so the picture is never stretched.
+rest, so the picture is never stretched. ``upright`` applies the EXIF
+orientation first, so a phone photo taken in portrait is treated as portrait.
 
 Only PIL is imported, so launchers can run this file directly before the
 xfuser package (and its GPU checks) is importable::
@@ -17,10 +18,15 @@ from __future__ import annotations
 import argparse
 import math
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 DEFAULT_AREA = 960 * 544
 DEFAULT_DIVISOR = 32
+
+
+def upright(image: Image.Image) -> Image.Image:
+    """``image`` rotated as its EXIF orientation says it should be displayed."""
+    return ImageOps.exif_transpose(image) or image
 
 
 def fit_resolution(
@@ -59,7 +65,7 @@ def main(argv=None) -> None:
     parser.add_argument("--divisor", type=int, default=DEFAULT_DIVISOR)
     args = parser.parse_args(argv)
     with Image.open(args.image) as image:
-        width, height = fit_resolution(image.size, args.area, args.divisor)
+        width, height = fit_resolution(upright(image).size, args.area, args.divisor)
     print(width, height)
 
 

@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xDiT live stream</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; background: #111; color: #eee; }
+  main { max-width: 1320px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; }
+  .stage { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; align-items: start; }
+  @media (max-width: 1000px) { .stage { grid-template-columns: 1fr; } }
+  .player { display: grid; gap: 8px; }
+  video { width: 100%; max-height: 72vh; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; }
+  .side { max-height: calc(72vh + 52px); overflow-y: auto; }
+  .clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+  #history .clamp { -webkit-line-clamp: 2; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #prompt { flex: 1; min-width: 280px; padding: 10px; font-size: 16px; background: #222; color: #eee;
+            border: 1px solid #444; border-radius: 4px; }
+  button { padding: 10px 14px; font-size: 15px; background: #2d5be3; color: #fff; border: 0;
+           border-radius: 4px; cursor: pointer; }
+  button.secondary { background: #444; }
+  button.on { background: #3a7d3a; }
+  .panel { background: #1b1b1b; border-radius: 6px; padding: 10px 12px; font-size: 14px; line-height: 1.45; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: #999; margin: 0 0 6px; }
+  .label { color: #999; }
+  .state { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 12px; background: #444; }
+  .state.queued { background: #6b5a1e; } .state.enhancing { background: #7a4a14; }
+  .state.rendering { background: #2d5be3; } .state.live { background: #3a7d3a; }
+  #history { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  #history li { border-left: 3px solid #444; padding-left: 8px; }
+  #history li.web { border-color: #2d5be3; } #history li.demo { border-color: #b07b1e; }
+  #history .meta { color: #999; font-size: 12px; }
+  #banner { display: none; padding: 10px; background: #7a2; color: #fff; border-radius: 4px; cursor: pointer; }
+  #message { display: none; padding: 10px; border-radius: 4px; }
+  #message.error { display: block; background: #a33; } #message.info { display: block; background: #264d26; }
+  #diag { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 2px 16px;
+          font: 13px ui-monospace, monospace; }
+  #diag span { color: #9cf; }
+</style>
+</head>
+<body>
+<main>
+  <div id="message"></div>
+  <div id="banner">The browser paused playback. Click here to start.</div>
+  <div class="stage">
+    <div class="player">
+      <video id="video" muted autoplay playsinline></video>
+      <form id="prompt-form" class="row">
+        <input id="prompt" autocomplete="off" maxlength="2000"
+               placeholder="Describe how the video should continue, e.g. a red fox walks in and waves">
+        <button type="submit">Send</button>
+        <button type="button" class="secondary" id="overlay">Overlay: off</button>
+        <button type="button" class="secondary" id="sound">Unmute</button>
+        <button type="button" class="secondary" id="live">Go live</button>
+      </form>
+    </div>
+    <div class="panel side">
+      <h2>Now</h2>
+      <div><span class="label">On screen:</span> <span id="on-screen" class="clamp">-</span></div>
+      <div><span class="label">Latest request:</span> <span id="latest-state" class="state">-</span>
+        <span id="latest-text" class="clamp">-</span></div>
+      <h2 style="margin-top: 12px">Recent prompts</h2>
+      <ul id="history"></ul>
+    </div>
+  </div>
+  <details class="panel" open>
+    <summary>Diagnostics</summary>
+    <div id="diag"></div>
+  </details>
+</main>
+<script>
+"use strict";
+
+// Play this far behind the newest buffered frame; speed up past CHASE, jump past JUMP.
+const TARGET_LAG = 1.5, CHASE_LAG = 3.0, JUMP_LAG = 8.0;
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const diag = {
+  connection: "connecting", codecs: "-", reconnects: 0, receivedMB: 0, mbps: "-",
+  bufferAhead: "-", playbackRate: "1.00", stalls: 0, stallSeconds: 0,
+  serverBuffer: "-", serverStalls: "-", chunkGen: "-", viewers: "-", lastError: "-",
+};
+
+function showMessage(text, kind = "error") {
+  const box = $("message");
+  box.textContent = text;
+  box.className = text ? kind : "";
+}
+
+function renderDiag() {
+  const box = $("diag");
+  box.replaceChildren(...Object.entries(diag).map(([key, value]) => {
+    const row = document.createElement("div");
+    const span = document.createElement("span");
+    span.textContent = String(value);
+    row.append(`${key}: `, span);
+    return row;
+  }));
+}
+
+class Player {
+  constructor(element) {
+    this.video = element;
+    this.session = 0;
+    this.queue = [];
+    this.buffer = null;
+    this.bytes = 0;
+    this.bytesAt = performance.now();
+    this.stallStart = null;
+    element.addEventListener("waiting", () => { if (this.stallStart === null) this.stallStart = performance.now(); });
+    element.addEventListener("playing", () => {
+      if (this.stallStart === null) return;
+      const seconds = (performance.now() - this.stallStart) / 1000;
+      this.stallStart = null;
+      if (seconds < 0.2) return;
+      diag.stalls += 1;
+      diag.stallSeconds = +(diag.stallSeconds + seconds).toFixed(1);
+    });
+    setInterval(() => this.watch(), 500);
+    this.connect();
+  }
+
+  async connect() {
+    const session = ++this.session;
+    this.queue = [];
+    this.buffer = null;
+    const mediaSource = new MediaSource();
+    const url = URL.createObjectURL(mediaSource);
+    this.video.src = url;
+    await new Promise((resolve) => mediaSource.addEventListener("sourceopen", resolve, { once: true }));
+    URL.revokeObjectURL(url);
+    try {
+      diag.connection = "connecting";
+      const response = await fetch("stream.mp4", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const codecs = response.headers.get("X-Codecs") || "avc1.640028,mp4a.40.2";
+      const type = `video/mp4; codecs="${codecs}"`;
+      if (!MediaSource.isTypeSupported(type)) {
+        showMessage(`This browser cannot play ${type}. Use a recent Chrome or Edge.`);
+        return;
+      }
+      diag.codecs = codecs;
+      this.buffer = mediaSource.addSourceBuffer(type);
+      this.buffer.addEventListener("updateend", () => this.pump());
+      diag.connection = "live";
+      const reader = response.body.getReader();
+      while (session === this.session) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        this.bytes += value.byteLength;
+        diag.receivedMB = +(diag.receivedMB + value.byteLength / 1e6).toFixed(1);
+        this.queue.push(value);
+        this.pump();
+      }
+    } catch (error) {
+      diag.lastError = `stream: ${error.message}`;
+    }
+    if (session !== this.session) return;
+    diag.connection = "reconnecting";
+    diag.reconnects += 1;
+    setTimeout(() => this.connect(), 1500);
+  }
+
+  pump() {
+    const buffer = this.buffer;
+    if (!buffer || buffer.updating || !this.queue.length) return;
+    const now = this.video.currentTime;
+    if (buffer.buffered.length && now - buffer.buffered.start(0) > 30) {
+      buffer.remove(0, now - 10);  // updateend pumps again
+      return;
+    }
+    const size = this.queue.reduce((total, part) => total + part.byteLength, 0);
+    const data = new Uint8Array(size);
+    let offset = 0;
+    for (const part of this.queue) { data.set(part, offset); offset += part.byteLength; }
+    this.queue = [];
+    try {
+      buffer.appendBuffer(data);
+    } catch (error) {
+      diag.lastError = `append: ${error.name}`;
+      this.connect();
+    }
+  }
+
+  liveEdge() {
+    const ranges = this.video.buffered;
+    return ranges.length ? ranges.end(ranges.length - 1) : null;
+  }
+
+  goLive() {
+    const edge = this.liveEdge();
+    if (edge !== null) this.video.currentTime = Math.max(0, edge - TARGET_LAG);
+    this.play();
+  }
+
+  play() {
+    if (!this.video.paused) return;
+    this.video.play().then(
+      () => { $("banner").style.display = "none"; },
+      () => { $("banner").style.display = "block"; },
+    );
+  }
+
+  watch() {
+    const elapsed = (performance.now() - this.bytesAt) / 1000;
+    if (elapsed >= 2) {
+      diag.mbps = ((this.bytes * 8) / elapsed / 1e6).toFixed(2);
+      this.bytes = 0;
+      this.bytesAt = performance.now();
+    }
+    const edge = this.liveEdge();
+    if (edge !== null) {
+      const ranges = this.video.buffered;
+      const now = this.video.currentTime;
+      const lag = edge - now;
+      if (now < ranges.start(0) || lag > JUMP_LAG) {
+        this.goLive();
+      } else {
+        // Catch up gently instead of jumping when a little behind live.
+        this.video.playbackRate = lag > CHASE_LAG ? 1.1 : lag < TARGET_LAG ? 1.0 : this.video.playbackRate;
+        this.play();
+      }
+      diag.bufferAhead = `${Math.max(0, lag).toFixed(1)} s`;
+      diag.playbackRate = this.video.playbackRate.toFixed(2);
+    }
+    renderDiag();
+  }
+}
+
+function describe(prompt) {
+  return prompt ? `#${prompt.id} ${prompt.text}` : "-";
+}
+
+function renderStatus(status) {
+  const byId = new Map(status.prompts.map((prompt) => [prompt.id, prompt]));
+  const onScreen = status.on_screen_prompt_id;
+  $("on-screen").textContent = $("on-screen").title =
+    onScreen ? describe(byId.get(onScreen) || { id: onScreen, text: "" }) : "opening scene";
+
+  const latest = status.prompts[0];
+  const state = status.prompt_state;
+  let label = "-";
+  if (latest) {
+    if (latest.latency_s != null || latest.id <= onScreen) label = "live";
+    else if (state && state.id === latest.id) label = state.status;
+    else label = "queued";
+  }
+  $("latest-state").textContent = label;
+  $("latest-state").className = `state ${label}`;
+  $("latest-text").textContent = $("latest-text").title = describe(latest);
+
+  $("history").replaceChildren(...status.prompts.map((prompt) => {
+    const item = document.createElement("li");
+    item.className = prompt.source;
+    const text = document.createElement("div");
+    text.className = "clamp";
+    text.textContent = text.title = describe(prompt);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const shown = prompt.latency_s != null ? `, on screen after ${prompt.latency_s.toFixed(1)} s` : "";
+    meta.textContent = `${prompt.source} at ${new Date(prompt.ts * 1000).toLocaleTimeString()}${shown}`;
+    item.append(text, meta);
+    return item;
+  }));
+
+  $("overlay").textContent = `Overlay: ${status.overlay ? "on" : "off"}`;
+  $("overlay").className = status.overlay ? "on" : "secondary";
+  video.style.aspectRatio = `${status.video.width} / ${status.video.height}`;
+  diag.serverBuffer = `${status.buffered_s.toFixed(1)} s`;
+  diag.serverStalls = `${(status.stall_frames / status.video.fps).toFixed(1)} s`;
+  diag.chunkGen = status.last_gen_time_s == null ? "-" : `${status.last_gen_time_s.toFixed(2)} s`;
+  diag.viewers = `${status.viewers.web} web / ${status.viewers.ts} vlc`;
+}
+
+async function pollStatus() {
+  while (true) {
+    try {
+      const response = await fetch("api/status", { cache: "no-store" });
+      renderStatus(await response.json());
+    } catch (error) {
+      diag.lastError = `status: ${error.message}`;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+async function post(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const reply = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(reply.error || `HTTP ${response.status}`);
+  return reply;
+}
+
+$("prompt-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("prompt");
+  try {
+    const reply = await post("api/prompt", { prompt: input.value });
+    input.value = "";
+    if ("overlay" in reply) showMessage(`Overlay ${reply.overlay ? "on" : "off"}.`, "info");
+    else showMessage(`Queued prompt #${reply.id}; it cuts in once it is enhanced and rendered.`, "info");
+  } catch (error) {
+    showMessage(`Could not send the prompt: ${error.message}`);
+  }
+});
+
+$("overlay").addEventListener("click", () =>
+  post("api/overlay").catch((error) => showMessage(`Overlay toggle failed: ${error.message}`)));
+
+// Browsers only autoplay muted video; unmuting needs a click.
+$("sound").addEventListener("click", () => {
+  video.muted = !video.muted;
+  $("sound").textContent = video.muted ? "Unmute" : "Mute";
+  player.play();
+});
+
+let player = null;
+if (!window.MediaSource) {
+  showMessage("This browser has no Media Source Extensions. Use a recent Chrome or Edge.");
+} else {
+  player = new Player(video);
+  $("banner").addEventListener("click", () => player.play());
+  $("live").addEventListener("click", () => player.goLive());
+}
+pollStatus();
+renderDiag();
+</script>
+</body>
+</html>

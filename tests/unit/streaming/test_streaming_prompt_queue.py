@@ -70,3 +70,51 @@ def test_overlay_switch_toggles_and_clears(tmp_path):
 def test_clean_prompt_strips_arrow_key_escapes():
     typed = "They are oing\x1b[D\x1b[D\x1b[D to a submarine\x1b[C\x1b[C,  then\tswim"
     assert clean_prompt(typed) == "They are oing to a submarine, then swim"
+
+
+def test_watch_prompts_announces_new_prompts_from_elsewhere(tmp_path):
+    import threading
+    import time
+
+    from xfuser.streaming.prompt_cli import watch_prompts
+
+    append_prompt(tmp_path, "before the console opened")
+    stop, seen, typed, lock = threading.Event(), [], set(), threading.Lock()
+    watcher = threading.Thread(
+        target=watch_prompts, args=(tmp_path, stop, seen.append, typed, lock), kwargs={"poll_s": 0.01}
+    )
+    watcher.start()
+    time.sleep(0.05)
+    append_prompt(tmp_path, "from the page", source="web")
+    with lock:
+        typed.add(append_prompt(tmp_path, "typed here").id)
+    append_prompt(tmp_path, "scripted", source="demo")
+    deadline = time.monotonic() + 5
+    while len(seen) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    watcher.join()
+
+    assert [(p.text, p.source) for p in seen] == [("from the page", "web"), ("scripted", "demo")]
+
+
+def test_prompts_keep_their_source(tmp_path):
+    append_prompt(tmp_path, "typed")
+    append_prompt(tmp_path, "from the page", source="web")
+    append_prompt(tmp_path, "scripted", source="demo")
+
+    assert [p.source for p in read_new_prompts(tmp_path, 0)] == ["console", "web", "demo"]
+
+
+def test_concurrent_appends_get_unique_ids(tmp_path):
+    import threading
+
+    threads = [threading.Thread(target=append_prompt, args=(tmp_path, f"prompt {i}")) for i in range(32)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    prompts = read_new_prompts(tmp_path, 0)
+    assert sorted(p.id for p in prompts) == list(range(1, 33))
+    assert sorted(p.text for p in prompts) == sorted(f"prompt {i}" for i in range(32))

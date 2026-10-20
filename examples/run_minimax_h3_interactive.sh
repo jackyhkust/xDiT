@@ -1,32 +1,44 @@
 #!/bin/bash
-# Interactive, continuous MiniMax-H3 I2V stream, playable in VLC. Run INSIDE the
-# xDiT container (see examples/docker_minimax_h3_interactive.sh for the host side).
+# Interactive, continuous MiniMax-H3 I2V stream, watched and steered from a web
+# page (or played in VLC). Run INSIDE the xDiT container (see
+# examples/docker_minimax_h3_interactive.sh for the host side).
 #
-#   bash examples/run_minimax_h3_interactive.sh [--demo]
+#   bash examples/run_minimax_h3_interactive.sh [--cli] [--demo]
 #
 # By default the stream opens on assets/amd_gpu_keynote.jpg (a presenter holding
 # up an AMD GPU on a keynote stage) with the prompt in assets/amd_gpu_keynote.txt.
 # Override with ANCHOR=/path/anchor.png PROMPT="..." (or PROMPT_FILE=...).
 #
-# Then, in another shell in the same container:
+# Prompts come from the web page; the terminal prints them as they are queued.
+# Ctrl-C stops everything.
+#
+# --cli (or CLI=1) also opens the terminal prompt console: type a new scene and
+# it transitions in smoothly; /overlay shows or hides the buffered frames and
+# latest input on the video; /status prints the prompt state. /quit or Ctrl-D
+# closes only the console; the stream, page and demo keep running. More consoles
+# can be opened in other shells in the same container:
 #   python -m xfuser.streaming.prompt_cli --stream_dir /dev/shm/h3_stream
-#   # type a new scene; it transitions in smoothly without a cut.
-#   # type /overlay to show or hide the buffered frames and latest input on the video.
 #
 # Demo mode (pass --demo or set DEMO=1): after DEMO_INTERVAL_S (30) seconds with
-# no new prompt, the console queues a scripted one: a character joins (or, at
-# three, one leaves and another joins), the cast promotes an AMD product, with a
-# random storyline and style. Typed prompts still work and restart the countdown.
-# DEMO_CAST="the white cat" counts characters already in the opening scene.
+# no new prompt from anywhere (page, console or demo), a scripted one is queued:
+# a character joins (or, at three, one leaves and another joins), the cast
+# promotes an AMD product, with a random storyline and style. It works with or
+# without --cli. DEMO_CAST="the white cat" counts characters already in the
+# opening scene.
+#
+# FAKE_GENERATOR=1 swaps the model for a CPU test pattern (no GPUs, starts in
+# seconds) to try the page, prompts, overlay and demo mode.
 #
 # Watch it (from a laptop first open a tunnel to the node):
 #   ssh -N -L 18080:127.0.0.1:20123 yatholam@smci355-ccs-aus-m06-17.cs-aus.dcgpu
-#   vlc --network-caching=500 http://127.0.0.1:18080/stream.ts   # stats at /stats
+#   open http://127.0.0.1:18080/ in Chrome: video, prompt box, overlay switch, status
+#   or: vlc --network-caching=500 http://127.0.0.1:18080/stream.ts   # stats at /stats
 set -euo pipefail
 
 for arg in "$@"; do
     case "$arg" in
         --demo) DEMO=1 ;;
+        --cli) CLI=1 ;;
         *) echo "Unknown argument: $arg (settings are environment variables)" >&2; exit 2 ;;
     esac
 done
@@ -67,7 +79,8 @@ ENHANCER_MAX_NEW_TOKENS=${ENHANCER_MAX_NEW_TOKENS:-384}
 CRF=${CRF:-23}
 MAX_KBPS=${MAX_KBPS:-3000}
 COND_COLOR_MATCH=${COND_COLOR_MATCH:-none}
-INTERACTIVE_CLI=${INTERACTIVE_CLI:-1}
+CLI=${CLI:-${INTERACTIVE_CLI:-0}}
+FAKE_GENERATOR=${FAKE_GENERATOR:-0}
 # Initial overlay state; /overlay in the prompt console switches it at runtime.
 OVERLAY=${OVERLAY:-0}
 CUT_IN=${CUT_IN:-1}
@@ -94,37 +107,57 @@ python -m xfuser.streaming.ts_server \
 STREAMER_PID=$!
 
 # 2. Generator: torchrun job that chains I2V chunks and applies viewer prompts.
-torchrun --nproc_per_node "$NPROC" entrypoints/minimax_h3_stream.py \
-    --model MiniMax-H3 --task i2va \
-    --prompt "$PROMPT" --input_images "$ANCHOR" \
-    --height "$HEIGHT" --width "$WIDTH" --num_frames "$NUM_FRAMES" --num_inference_steps "$STEPS" \
-    --attention_backend aiter_bf16 --use_fp8_gemms \
-    --ulysses_degree "$NPROC" --use_parallel_vae --use_torch_compile --warmup_calls 1 \
-    --stream_dir "$STREAM_DIR" --duration_s "$DURATION_S" --output_directory "$OUTPUT_DIR" \
-    --max_ahead_chunks "$MAX_AHEAD_CHUNKS" --transition_chunks "$TRANSITION_CHUNKS" \
-    --prompt_enhancer "$PROMPT_ENHANCER" --enhancer_max_new_tokens "$ENHANCER_MAX_NEW_TOKENS" \
-    --cond_color_match "$COND_COLOR_MATCH" "$CUT_IN_FLAG" \
-    $EXTRA_ARGS > "$OUTPUT_DIR/generator.log" 2>&1 &
+if [[ "$FAKE_GENERATOR" == "1" ]]; then
+    # The streamer clears the stream directory before it listens; start writing after that.
+    for _ in $(seq 240); do
+        (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
+        sleep 0.5
+    done
+    python -m xfuser.streaming.fake_generator \
+        --stream_dir "$STREAM_DIR" --width "$WIDTH" --height "$HEIGHT" --num_frames "$NUM_FRAMES" \
+        --anchor "$ANCHOR" --prompt "$PROMPT" --max_ahead_chunks "${FAKE_MAX_AHEAD_CHUNKS:-1}" \
+        > "$OUTPUT_DIR/generator.log" 2>&1 &
+else
+    torchrun --nproc_per_node "$NPROC" entrypoints/minimax_h3_stream.py \
+        --model MiniMax-H3 --task i2va \
+        --prompt "$PROMPT" --input_images "$ANCHOR" \
+        --height "$HEIGHT" --width "$WIDTH" --num_frames "$NUM_FRAMES" --num_inference_steps "$STEPS" \
+        --attention_backend aiter_bf16 --use_fp8_gemms \
+        --ulysses_degree "$NPROC" --use_parallel_vae --use_torch_compile --warmup_calls 1 \
+        --stream_dir "$STREAM_DIR" --duration_s "$DURATION_S" --output_directory "$OUTPUT_DIR" \
+        --max_ahead_chunks "$MAX_AHEAD_CHUNKS" --transition_chunks "$TRANSITION_CHUNKS" \
+        --prompt_enhancer "$PROMPT_ENHANCER" --enhancer_max_new_tokens "$ENHANCER_MAX_NEW_TOKENS" \
+        --cond_color_match "$COND_COLOR_MATCH" "$CUT_IN_FLAG" \
+        $EXTRA_ARGS > "$OUTPUT_DIR/generator.log" 2>&1 &
+fi
 GENERATOR_PID=$!
 
 DEMO_PID=""
-cleanup() { kill "$STREAMER_PID" "$GENERATOR_PID" $DEMO_PID 2>/dev/null || true; }
-trap cleanup INT TERM EXIT
+FEED_PID=""
+cleanup() { kill "$STREAMER_PID" "$GENERATOR_PID" $DEMO_PID $FEED_PID 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 echo "Canvas ${WIDTH}x${HEIGHT}. Streamer PID $STREAMER_PID, generator PID $GENERATOR_PID."
-echo "Logs: $OUTPUT_DIR/{streamer,generator}.log"
-echo "Stream: http://127.0.0.1:$PORT/stream.ts  (stats at /stats)"
+echo "Logs: $OUTPUT_DIR/{streamer,generator,demo,console}.log"
+echo "Web page: http://127.0.0.1:$PORT/   VLC: http://127.0.0.1:$PORT/stream.ts  (stats at /stats)"
 
-if [[ "$INTERACTIVE_CLI" == "1" ]]; then
-    # Foreground prompt console; closing it (Ctrl-D) stops the stream via the trap.
-    echo "Type new prompts below. /overlay toggles the on-video info. Ctrl-D to stop everything."
-    python -m xfuser.streaming.prompt_cli --stream_dir "$STREAM_DIR" "${DEMO_ARGS[@]}" || true
-else
-    # Headless: run the demo loop (if enabled) and wait for the generator to finish.
-    if [[ "$DEMO" == "1" ]]; then
-        python -m xfuser.streaming.prompt_cli --stream_dir "$STREAM_DIR" "${DEMO_ARGS[@]}" --no_console \
-            > "$OUTPUT_DIR/demo.log" 2>&1 &
-        DEMO_PID=$!
-    fi
-    wait "$GENERATOR_PID"
+# 3. Demo loop: its own process, so it keeps going whether or not a console is open.
+if [[ "$DEMO" == "1" ]]; then
+    python -m xfuser.streaming.prompt_cli --stream_dir "$STREAM_DIR" "${DEMO_ARGS[@]}" --no_console --quiet \
+        > "$OUTPUT_DIR/demo.log" 2>&1 &
+    DEMO_PID=$!
 fi
+
+# 4. Optional terminal console; it also prints prompts from the page and the demo.
+if [[ "$CLI" == "1" ]]; then
+    echo "Type new prompts below. /overlay toggles the on-video info, /status shows the prompt state."
+    echo "/quit or Ctrl-D closes the console (the stream keeps running); Ctrl-C stops everything."
+    python -m xfuser.streaming.prompt_cli --stream_dir "$STREAM_DIR" 2>>"$OUTPUT_DIR/console.log" || true
+fi
+
+# 5. Until the generator exits: print prompts as they are queued.
+echo "Prompts from the web page${DEMO_PID:+ and the demo} are shown below. Ctrl-C stops everything."
+python -m xfuser.streaming.prompt_cli --stream_dir "$STREAM_DIR" --no_console 2>>"$OUTPUT_DIR/console.log" &
+FEED_PID=$!
+wait "$GENERATOR_PID"

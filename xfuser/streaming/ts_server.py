@@ -3,10 +3,11 @@
 Reads ``chunk_*.npz`` files from a stream directory in order, stitches them into
 one continuous timeline (``ChunkStitcher``), and plays that timeline out at a
 fixed frame rate. It encodes once (H.264 + AAC in MPEG-TS) and fans the bytes
-out to every HTTP client::
+out to every HTTP client, and encodes a second copy as fragmented MP4 for the
+web page at ``/`` (see ``xfuser.streaming.web``)::
 
     python -m xfuser.streaming.ts_server --stream_dir /dev/shm/h3_stream --port 20123
-    vlc http://<host>:20123/stream.ts
+    vlc http://<host>:20123/stream.ts      # or open http://<host>:20123/ in Chrome
 
 The playout clock never waits for the generator. Until the first chunks arrive
 it shows the anchor image. When the buffer runs dry it repeats the last frame
@@ -51,10 +52,20 @@ from xfuser.streaming.prompt_queue import (
     read_new_prompts,
     read_overlay,
     read_prompt_state,
+    toggle_overlay,
     write_overlay,
 )
-from xfuser.streaming.resolution import cover_resize
+from xfuser.streaming.resolution import cover_resize, upright
 from xfuser.streaming.stitch import ChunkStitcher
+from xfuser.streaming.web import (
+    INDEX_HTML,
+    MAX_PROMPT_BYTES,
+    MP4_MOVFLAGS,
+    Mp4FanOut,
+    codecs_from_init,
+)
+from xfuser.streaming.web import status as web_status
+from xfuser.streaming.web import submit as submit_prompt
 
 logger = init_logger(__name__)
 
@@ -180,7 +191,7 @@ def load_still(path: str | None, width: int, height: int) -> np.ndarray:
         return np.zeros((height, width, 3), dtype=np.uint8)
     from PIL import Image
 
-    return np.asarray(cover_resize(Image.open(path).convert("RGB"), (width, height)))
+    return np.asarray(cover_resize(upright(Image.open(path)).convert("RGB"), (width, height)))
 
 
 class Streamer:
@@ -204,6 +215,7 @@ class Streamer:
         audio_bitrate: int = 192_000,
         max_client_lag_s: float = 10.0,
         overlay: bool = False,
+        web: bool = True,
     ) -> None:
         self.stream_dir = Path(stream_dir)
         self.width, self.height = width, height
@@ -219,6 +231,8 @@ class Streamer:
 
         self.anchor = load_still(anchor_image, width, height)
         self.sink = FanOut(max_queued_frames=int(max_client_lag_s * fps), record_path=record_path)
+        # A second encode of the same playout as fragmented MP4 for the web page.
+        self.web = Mp4FanOut(max_queued_fragments=max(2, round(max_client_lag_s * fps / self.gop))) if web else None
         self.stitcher = ChunkStitcher(fps, sample_rate, channels)
 
         self.overlay = Overlay(fps)
@@ -414,10 +428,14 @@ class Streamer:
             buffered = len(self._frames)
         return self.overlay.render(frame, buffered_frames=buffered, user_text=self._latest_input)
 
-    def _open_container(self):
+    def _open_output(self, sink, format: str):
         import av
 
-        container = av.open(self.sink, mode="w", format="mpegts")
+        if format == "mp4":
+            # One self-describing fragment per GOP, as Media Source Extensions expect.
+            container = av.open(sink, mode="w", format="mp4", options={"movflags": MP4_MOVFLAGS})
+        else:
+            container = av.open(sink, mode="w", format=format)
         video = container.add_stream("libx264", rate=self.fps)
         video.width, video.height = self.width, self.height
         video.pix_fmt = "yuv420p"
@@ -429,8 +447,10 @@ class Streamer:
             "g": str(self.gop),
             "keyint_min": str(self.gop),
             "sc_threshold": "0",
-            "x264-params": "repeat-headers=1",
         }
+        if format == "mpegts":
+            # In-band SPS/PPS on every keyframe, so a TS client can join at any GOP.
+            video.options["x264-params"] = "repeat-headers=1"
         if self.max_kbps:
             # Capped CRF: keeps quality-driven rate control but clips scene-change
             # spikes that would make a thin link (e.g. an SSH tunnel) fall behind.
@@ -438,10 +458,14 @@ class Streamer:
         audio = container.add_stream("aac", rate=self.sample_rate)
         audio.layout = "stereo" if self.channels == 2 else "mono"
         audio.bit_rate = self.audio_bitrate
-        return av, container, video, audio
+        return container, video, audio
 
     def _play_loop(self) -> None:
-        av, container, video_stream, audio_stream = self._open_container()
+        import av
+
+        outputs = [self._open_output(self.sink, "mpegts")]
+        if self.web is not None:
+            outputs.append(self._open_output(self.web, "mp4"))
         fifo = av.AudioFifo()
         layout = "stereo" if self.channels == 2 else "mono"
         audio_pts = 0
@@ -463,8 +487,9 @@ class Streamer:
 
                 video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
                 video_frame.pts = self.frames_emitted
-                for packet in video_stream.encode(video_frame):
-                    container.mux(packet)
+                for container, video_stream, _ in outputs:
+                    for packet in video_stream.encode(video_frame):
+                        container.mux(packet)
 
                 audio_frame = av.AudioFrame.from_ndarray(
                     np.ascontiguousarray(samples).reshape(1, -1), format="flt", layout=layout
@@ -476,21 +501,25 @@ class Streamer:
                     block.pts = audio_pts
                     block.time_base = Fraction(1, self.sample_rate)
                     audio_pts += block.samples
-                    for packet in audio_stream.encode(block):
-                        container.mux(packet)
+                    for container, _, audio_stream in outputs:
+                        for packet in audio_stream.encode(block):
+                            container.mux(packet)
 
                 self.frames_emitted += 1
                 self.sink.flush_frame()
                 if self.finished.is_set():
                     break
         finally:
-            for packet in video_stream.encode():
-                container.mux(packet)
-            for packet in audio_stream.encode():
-                container.mux(packet)
-            container.close()
+            for container, video_stream, audio_stream in outputs:
+                for packet in video_stream.encode():
+                    container.mux(packet)
+                for packet in audio_stream.encode():
+                    container.mux(packet)
+                container.close()
             self.sink.flush_frame()
             self.sink.close()
+            if self.web is not None:
+                self.web.close()
             self.finished.set()
             logger.info(f"Playout stopped: {self.summary()}")
 
@@ -512,6 +541,7 @@ class Streamer:
                 "buffered_s": round(len(self._frames) / self.fps, 3),
                 "max_clock_lag_s": round(self.max_lag_s, 4),
                 "clients": self.sink.num_clients,
+                "web_clients": self.web.num_clients if self.web is not None else 0,
                 "recent_chunks": list(self.recent_chunks),
             }
 
@@ -535,17 +565,70 @@ def make_handler(streamer: Streamer):
 
         def do_GET(self):
             path = self.path.split("?")[0]
-            if path in ("/", "/stream.ts"):
+            if path == "/stream.ts":
                 self._stream()
+            elif path == "/stream.mp4" and streamer.web is not None:
+                self._stream_mp4()
+            elif path in ("/", "/index.html") and streamer.web is not None:
+                self._send(200, INDEX_HTML.read_bytes(), "text/html; charset=utf-8")
             elif path == "/stats":
-                body = json.dumps(streamer.summary(), indent=2).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json(200, streamer.summary())
+            elif path == "/api/status":
+                self._send_json(200, web_status(streamer))
             else:
                 self.send_error(404)
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            if path == "/api/overlay":
+                self._send_json(200, {"overlay": toggle_overlay(streamer.stream_dir)})
+            elif path == "/api/prompt":
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > MAX_PROMPT_BYTES:
+                    self._send_json(413, {"error": "The prompt is too long."})
+                    return
+                try:
+                    text = str(json.loads(self.rfile.read(length) or b"{}").get("prompt", ""))
+                except (ValueError, AttributeError):
+                    self._send_json(400, {"error": 'Send JSON like {"prompt": "..."}.'})
+                    return
+                self._send_json(*submit_prompt(streamer.stream_dir, text))
+            else:
+                self.send_error(404)
+
+        def _send(self, code: int, body: bytes, content_type: str):
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_json(self, code: int, payload: dict):
+            self._send(code, json.dumps(payload, indent=2).encode(), "application/json")
+
+        def _stream_mp4(self):
+            joined = streamer.web.add_client(timeout=30)
+            if joined is None:
+                self.send_error(503, "The stream has not started yet.")
+                return
+            client, init = joined
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("X-Codecs", codecs_from_init(init))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            logger.info(f"Web viewer {self.client_address[0]} connected.")
+            try:
+                self.wfile.write(init)
+                while (fragment := client.get()) is not None:
+                    self.wfile.write(fragment)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                streamer.web.remove_client(client)
+                logger.info(f"Web viewer {self.client_address[0]} disconnected.")
 
         def _stream(self):
             self.send_response(200)
@@ -603,6 +686,12 @@ def main(argv=None) -> None:
             "The prompt console's /overlay switches it at runtime."
         ),
     )
+    parser.add_argument(
+        "--web",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Serve the browser player and prompt box at / (a second, fragmented-MP4 encode).",
+    )
     args = parser.parse_args(argv)
 
     reset_stream_dir(args.stream_dir)
@@ -623,12 +712,16 @@ def main(argv=None) -> None:
         max_kbps=args.max_kbps,
         preset=args.preset,
         overlay=args.overlay,
+        web=args.web,
     )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(streamer))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="http", daemon=True).start()
     streamer.start()
-    logger.info(f"Streaming http://{args.host}:{args.port}/stream.ts (stats at /stats), reading {args.stream_dir}")
+    page = f", web page at http://{args.host}:{args.port}/" if args.web else ""
+    logger.info(
+        f"Streaming http://{args.host}:{args.port}/stream.ts (stats at /stats){page}, reading {args.stream_dir}"
+    )
 
     def shutdown(*_):
         streamer._stop.set()

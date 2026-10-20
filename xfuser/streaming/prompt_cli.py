@@ -10,7 +10,9 @@ The prompt directory is shared with the generator and the streamer through
 
 With ``--demo``, a scripted prompt (see ``xfuser.streaming.demo``) is queued
 whenever no prompt has arrived for ``--demo_interval_s``; typed prompts still
-work and restart that countdown.
+work and restart that countdown. Prompts from elsewhere (the web page, the demo,
+another console) are printed as they arrive. ``--no_console`` drops the input
+and only prints them (and runs the demo with ``--demo``).
 
 Commands:
     <text>        queue <text> as the next prompt
@@ -26,12 +28,15 @@ import json
 import re
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from xfuser.streaming.demo import DemoDirector, run_demo
 from xfuser.streaming.prompt_queue import (
     UserPrompt,
     append_prompt,
+    latest_prompt,
+    read_new_prompts,
     read_prompt_state,
     toggle_overlay,
 )
@@ -52,15 +57,9 @@ def _print_status(stream_dir: Path) -> None:
     print(json.dumps(state, indent=2))
 
 
-def _start_demo(args, lock: threading.Lock, stop: threading.Event, interactive: bool) -> threading.Thread:
+def _start_demo(args, lock: threading.Lock, stop: threading.Event) -> threading.Thread:
     cast = [name.strip() for name in args.demo_cast.split(",") if name.strip()] if args.demo_cast else []
     director = DemoDirector(cast=cast, seed=args.demo_seed)
-
-    def announce(prompt: UserPrompt) -> None:
-        print(f"\n[demo] queued prompt #{prompt.id}: {prompt.text}", flush=True)
-        if interactive and "readline" in sys.modules:
-            sys.modules["readline"].redisplay()
-
     thread = threading.Thread(
         target=run_demo,
         kwargs=dict(
@@ -68,11 +67,50 @@ def _start_demo(args, lock: threading.Lock, stop: threading.Event, interactive: 
             director=director,
             stop=stop,
             interval_s=args.demo_interval_s,
-            on_prompt=announce,
             lock=lock,
         ),
         name="demo",
         daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def watch_prompts(
+    stream_dir: Path,
+    stop: threading.Event,
+    announce: Callable[[UserPrompt], None],
+    skip: set[int] | None = None,
+    lock: threading.Lock | None = None,
+    poll_s: float = 0.5,
+) -> None:
+    """Call ``announce`` for each prompt queued after this starts, except ids in ``skip``.
+
+    Hold ``lock`` while queueing a prompt and adding its id to ``skip`` so it is never announced.
+    """
+    lock = lock or threading.Lock()
+    latest = latest_prompt(stream_dir)
+    seen = latest.id if latest else 0
+    while not stop.wait(poll_s):
+        with lock:
+            new = read_new_prompts(stream_dir, seen)
+            if new:
+                seen = new[-1].id
+            new = [prompt for prompt in new if not skip or prompt.id not in skip]
+        for prompt in new:
+            announce(prompt)
+
+
+def _start_feed(
+    stream_dir: Path, stop: threading.Event, skip: set[int], interactive: bool, lock: threading.Lock | None = None
+) -> threading.Thread:
+    def announce(prompt: UserPrompt) -> None:
+        print(f"\n[{prompt.source}] queued prompt #{prompt.id}: {prompt.text}", flush=True)
+        if interactive and "readline" in sys.modules:
+            sys.modules["readline"].redisplay()
+
+    thread = threading.Thread(
+        target=watch_prompts, args=(stream_dir, stop, announce, skip, lock), name="feed", daemon=True
     )
     thread.start()
     return thread
@@ -97,8 +135,9 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--no_console",
         action="store_true",
-        help="With --demo, run only the demo loop (no input) until interrupted.",
+        help="No input: print prompts as they are queued (and run the demo with --demo) until interrupted.",
     )
+    parser.add_argument("--quiet", action="store_true", help="With --no_console, do not print queued prompts.")
     args = parser.parse_args(argv)
 
     if args.prompt is not None:
@@ -112,12 +151,15 @@ def main(argv=None) -> None:
     lock = threading.Lock()
     stop = threading.Event()
     if args.no_console:
-        if not args.demo:
-            parser.error("--no_console needs --demo")
-        print(f"Demo mode for {args.stream_dir}: a new prompt every {args.demo_interval_s:.0f}s of quiet.")
-        demo = _start_demo(args, lock, stop, interactive=False)
+        if args.quiet and not args.demo:
+            parser.error("--no_console --quiet does nothing without --demo")
+        if args.demo:
+            print(f"Demo mode for {args.stream_dir}: a new prompt after {args.demo_interval_s:.0f}s without one.")
+            _start_demo(args, lock, stop)
+        if not args.quiet:
+            _start_feed(args.stream_dir, stop, skip=set(), interactive=False)
         try:
-            demo.join()
+            stop.wait()
         except KeyboardInterrupt:
             stop.set()
         return
@@ -133,7 +175,9 @@ def main(argv=None) -> None:
             f"Demo mode: a scripted prompt is queued after {args.demo_interval_s:.0f}s without a new prompt "
             "(the countdown starts once the video plays)."
         )
-        _start_demo(args, lock, stop, interactive=True)
+        _start_demo(args, lock, stop)
+    typed: set[int] = set()
+    _start_feed(args.stream_dir, stop, skip=typed, interactive=True, lock=lock)
     print()
     while True:
         try:
@@ -154,6 +198,7 @@ def main(argv=None) -> None:
             continue
         with lock:
             prompt = append_prompt(args.stream_dir, line)
+            typed.add(prompt.id)
         print(f"  queued prompt #{prompt.id}; it cuts in once it is enhanced and rendered.")
     stop.set()
     print("Console closed; the stream keeps running.", file=sys.stderr)

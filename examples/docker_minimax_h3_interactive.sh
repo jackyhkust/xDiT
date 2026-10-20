@@ -1,24 +1,33 @@
 #!/bin/bash
 # Host-side launcher for the interactive MiniMax-H3 stream. Runs the idle check,
-# starts the container (named with "yatholam"), and drops you into the in-container
-# launcher, which starts the streamer + generator and an interactive prompt console.
+# starts the container (named with "yatholam"), and runs the in-container launcher,
+# which starts the streamer + generator. Prompts come from the web page; the
+# terminal prints them as they arrive. Ctrl-C stops everything.
 #
-#   bash examples/docker_minimax_h3_interactive.sh [--demo]
+#   bash examples/docker_minimax_h3_interactive.sh [--cli] [--demo]
+#
+# --cli (or CLI=1) also opens the terminal prompt console (type prompts, /overlay,
+# /status); /quit closes only the console, the stream keeps running.
 #   GPUS=0,1,2,3,4,5,6,7 ANCHOR=/workspace/xDiT/assets/i2v_input.JPG \
 #     PROMPT="a white cat on a surfboard at a sunny beach" bash examples/docker_minimax_h3_interactive.sh
 #
 # Watch from a laptop:
 #   ssh -N -L 18080:127.0.0.1:20123 yatholam@smci355-ccs-aus-m06-17.cs-aus.dcgpu
-#   vlc --network-caching=500 http://127.0.0.1:18080/stream.ts
+#   open http://127.0.0.1:18080/ in Chrome: video, prompt box, overlay switch, status
+#   or: vlc --network-caching=500 http://127.0.0.1:18080/stream.ts
 # If the player still lags behind live, lower the bitrate further: CRF=26 MAX_KBPS=2000.
+# The page accepts prompts from anyone who can reach the port; it is bound to
+# 127.0.0.1 on the node, so only SSH-tunnel users can.
 #
 # Add --demo (or DEMO=1) for demo mode: a scripted AMD-promo prompt every
-# DEMO_INTERVAL_S (30) seconds without a new prompt. Typed prompts still work.
+# DEMO_INTERVAL_S (30) seconds without a new prompt from the page or console.
+# FAKE_GENERATOR=1 replaces the model with a CPU test pattern to try the page quickly.
 set -euo pipefail
 
 for arg in "$@"; do
     case "$arg" in
         --demo) DEMO=1 ;;
+        --cli) CLI=1 ;;
         *) echo "Unknown argument: $arg (settings are environment variables)" >&2; exit 2 ;;
     esac
 done
@@ -122,6 +131,7 @@ RUN=(docker run -it --rm --name "$NAME"
     -e ENHANCER_MAX_NEW_TOKENS="${ENHANCER_MAX_NEW_TOKENS:-384}"
     -e MAX_AHEAD_CHUNKS="${MAX_AHEAD_CHUNKS:-4}"
     -e DEMO="${DEMO:-0}" -e DEMO_INTERVAL_S="${DEMO_INTERVAL_S:-30}" ${DEMO_CAST+-e "DEMO_CAST=$DEMO_CAST"}
+    -e FAKE_GENERATOR="${FAKE_GENERATOR:-0}" -e CLI="${CLI:-0}"
     ${WIDTH:+-e WIDTH="$WIDTH"} ${HEIGHT:+-e HEIGHT="$HEIGHT"}
     -e OUTPUT_DIR=/output/stream
     -v "$SRC":/workspace/xDiT -v "$HF_ROOT":/raid/huggingface -v "$OUT_DIR":/output/stream

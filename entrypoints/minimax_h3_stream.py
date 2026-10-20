@@ -49,7 +49,7 @@ from xfuser.streaming.color import match_color_stats
 from xfuser.streaming.enhancer import PromptEnhancer
 from xfuser.streaming.history import FrameHistory
 from xfuser.streaming.local_snapshot import localize_modular_components, resolve_local_snapshot
-from xfuser.streaming.resolution import cover_resize
+from xfuser.streaming.resolution import cover_resize, upright
 from xfuser.streaming.prompt_queue import (
     STATE_ENHANCING,
     STATE_LIVE,
@@ -195,8 +195,9 @@ def main() -> None:
     # anchor the same size so chunk 0 has the same shapes as the rest: one
     # compiled graph, no recompiles mid-stream. Cover-and-crop so a canvas with
     # a different aspect ratio never stretches the picture.
-    anchor_image = cover_resize(input_args["input_images"][0].convert("RGB"), (width, height))
-    image_w, image_h = input_args["input_images"][0].size
+    source_image = upright(input_args["input_images"][0])
+    anchor_image = cover_resize(source_image.convert("RGB"), (width, height))
+    image_w, image_h = source_image.size
     if abs(image_w / image_h - width / height) > 0.05:
         log(
             f"The anchor is {image_w}x{image_h} but the canvas is {width}x{height}; it is center-cropped. "
