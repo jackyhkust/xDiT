@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import functools
 import inspect
+import os
 from types import MethodType, SimpleNamespace
 
 import numpy as np
@@ -331,6 +332,60 @@ def _wrap_compiled_forward(transformer, original_forward, compiled_forward, dyna
     return forward_outside_the_graph
 
 
+_LORA_A_SUFFIX = ".lora_A.default.weight"
+_LORA_B_SUFFIX = ".lora_B.default.weight"
+
+
+def _merge_lora_into_transformer(transformer, lora_path: str, alpha: float, scale: float) -> None:
+    """Fold a PEFT LoRA checkpoint into the transformer's Linear weights in place.
+
+    Must run before ``fuse_qkv_projections`` (which replaces the ``to_q/k/v`` the
+    adapter targets with a single ``to_qkv``) and before FP8 conversion, so the
+    merged weights are what gets quantized. Each target gets
+    ``W += (alpha / rank) * scale * (B @ A)``, matching PEFT's scaling. The
+    distilled lightx2v Turbo adapters let the base model sample in 4 or 8 steps.
+    """
+    from safetensors.torch import load_file
+
+    state_dict = load_file(lora_path)
+    pairs: dict[str, dict[str, torch.Tensor]] = {}
+    for key, tensor in state_dict.items():
+        if key.endswith(_LORA_A_SUFFIX):
+            pairs.setdefault(key[: -len(_LORA_A_SUFFIX)], {})["A"] = tensor
+        elif key.endswith(_LORA_B_SUFFIX):
+            pairs.setdefault(key[: -len(_LORA_B_SUFFIX)], {})["B"] = tensor
+        else:
+            raise ValueError(f"Unexpected LoRA tensor {key!r} in {lora_path}.")
+
+    merged = 0
+    missing_modules, incomplete = [], []
+    for name, ab in sorted(pairs.items()):
+        if "A" not in ab or "B" not in ab:
+            incomplete.append(name)
+            continue
+        try:
+            module = transformer.get_submodule(name)
+        except AttributeError:
+            missing_modules.append(name)
+            continue
+        lora_a, lora_b = ab["A"], ab["B"]
+        rank = lora_a.shape[0]
+        weight = module.weight
+        delta = (lora_b.to(torch.float32) @ lora_a.to(torch.float32)) * (alpha / rank * scale)
+        if delta.shape != tuple(weight.shape):
+            raise ValueError(f"LoRA delta {tuple(delta.shape)} does not match {name} weight {tuple(weight.shape)}.")
+        with torch.no_grad():
+            weight.add_(delta.to(weight.dtype).to(weight.device))
+        merged += 1
+    if incomplete or missing_modules:
+        raise ValueError(
+            f"LoRA {lora_path} did not merge cleanly: "
+            f"incomplete A/B pairs={incomplete[:3]}, unresolved modules={missing_modules[:3]} "
+            f"({len(missing_modules)} total)."
+        )
+    log(f"Merged Turbo LoRA {os.path.basename(lora_path)} into {merged} modules (alpha={alpha}, scale={scale}).")
+
+
 def _count_steps_as_forwards(scheduler) -> None:
     set_grid_points = scheduler.set_timesteps
 
@@ -525,6 +580,17 @@ class xFuserMiniMaxH3Model(xFuserModel):
         )
         pipe.update_components(transformer=transformer)
         pipe.load_components(dtype=torch.bfloat16)
+        # Distilled Turbo LoRA (lightx2v): merge before QKV fusion and FP8 so the
+        # base model samples in 4/8 steps. Env-driven to avoid the Flux-only
+        # --lora_path path, which forbids LoRA together with --use_fp8_gemms.
+        lora_path = os.environ.get("H3_TURBO_LORA")
+        if lora_path:
+            _merge_lora_into_transformer(
+                pipe.transformer,
+                lora_path,
+                alpha=float(os.environ.get("H3_TURBO_LORA_ALPHA", "8")),
+                scale=float(os.environ.get("H3_TURBO_LORA_SCALE", "1")),
+            )
         pipe.transformer.fuse_qkv_projections()
         pipe.text_encoder.lm_head = None
         self._parallelize_text_encoder(pipe.text_encoder)

@@ -67,6 +67,9 @@ I2VA_HEADER = (
 )
 
 
+REPLACE_PREFIX = "The video continues smoothly from the current frame, in one continuous shot without any cut."
+
+
 def _with_header(section: str) -> str:
     if section.lstrip().startswith("For the target video"):
         return section
@@ -205,6 +208,65 @@ class PromptEnhancer:
         return result
 
     @staticmethod
-    def fallback(current: str, user_text: str) -> EnhancedPrompt:
-        prompt = _naive_prompt(current, user_text)
+    def fallback(current: str, user_text: str, replace: bool = False) -> EnhancedPrompt:
+        """The prompt used without the enhancer.
+
+        By default the request is appended to ``current``. With ``replace`` it
+        takes the place of ``current``, so nothing from the old prompt, such as
+        quoted dialogue a model would keep speaking, carries over; the video
+        still continues from the conditioning frame.
+        """
+        user_text = user_text.strip()
+        if replace and user_text:
+            prompt = f"{REPLACE_PREFIX} {user_text}"
+        else:
+            prompt = _naive_prompt(current, user_text)
         return EnhancedPrompt(transition=prompt, continuation=prompt, raw="", ok=False)
+
+
+# Added after LTX-2.5's own I2V system prompt: the reference image is a live
+# frame, not the start of a fresh clip, and old lines must not be spoken again.
+LTX_LIVE_STREAM_RULES = """
+LIVE STREAM CONTEXT: the reference image is the current frame of a continuous live stream, and the request says what should happen next. Start from exactly what is on screen and bring the requested change in gradually and plausibly within the same continuous take. Include spoken dialogue only when the request asks for or clearly implies speech; otherwise describe only ambient sound and music.
+"""
+
+
+class LtxPromptEnhancer:
+    """Rewrite viewer prompts with LTX-2.5's dedicated Gemma 4 prompt enhancer.
+
+    The checkpoint ships a small vision-language Gemma 4 (``prompt_enhancer``)
+    that the pipeline loads with the rest of the model, so it is already on the
+    GPU. ``pipe.enhance_prompt`` runs it with Lightricks' I2V message template
+    and greedy decoding; here it sees the frame the next chunk starts from and
+    returns one caption, used for both the transition and the continuation.
+    """
+
+    def __init__(self, pipe, max_new_tokens: int = 384) -> None:
+        if getattr(pipe, "prompt_enhancer", None) is None or getattr(pipe, "processor", None) is None:
+            raise ValueError("this LTX checkpoint has no prompt_enhancer/processor component")
+        from diffusers.pipelines.ltx2.utils import LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT
+
+        self.pipe = pipe
+        self.system_prompt = LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT + LTX_LIVE_STREAM_RULES
+        self.max_new_tokens = max_new_tokens
+        self._device = next(pipe.transformer.parameters()).device
+
+    @torch.no_grad()
+    def enhance(self, original: str, current: str, user_text: str, last_frame: np.ndarray) -> EnhancedPrompt:
+        image = Image.fromarray(np.asarray(last_frame).astype("uint8")).convert("RGB")
+        start = time.perf_counter()
+        text = self.pipe.enhance_prompt(
+            prompt=user_text.strip(),
+            system_prompt=self.system_prompt,
+            max_new_tokens=self.max_new_tokens,
+            image=image,
+            device=self._device,
+        )[0].strip()
+        log(
+            f"Enhancer wrote {len(text.split())} words in {time.perf_counter() - start:.1f}s",
+            log_from_all_processes=True,
+        )
+        if not text:
+            log("Prompt enhancer returned nothing; using the request as written.", log_from_all_processes=True)
+            return PromptEnhancer.fallback(current, user_text, replace=True)
+        return EnhancedPrompt(transition=text, continuation=text, raw=text, ok=True)

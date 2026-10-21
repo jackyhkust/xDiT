@@ -22,6 +22,13 @@
 # Add --demo (or DEMO=1) for demo mode: a scripted AMD-promo prompt every
 # DEMO_INTERVAL_S (30) seconds without a new prompt from the page or console.
 # FAKE_GENERATOR=1 replaces the model with a CPU test pattern to try the page quickly.
+#
+# MODEL=ltx25 streams LTX-2.5 distilled on a smaller 768x448 canvas instead of
+# MiniMax-H3, e.g. on one GPU: GPUS=0 MODEL=ltx25 bash examples/docker_minimax_h3_interactive.sh
+#
+# TURBO=8 (or TURBO=4) merges the distilled lightx2v Turbo LoRA and samples in
+# 8 (or 4) steps instead of 12, for a faster generator. The adapters must live in
+# TURBO_LORA_HOST (default ~/phantom/turbo_lora); it is mounted read-only.
 set -euo pipefail
 
 for arg in "$@"; do
@@ -37,8 +44,8 @@ GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 PORT=${PORT:-20123}
 SRC=${SRC:-$(cd "$(dirname "$0")/.." && pwd)}
 HF_ROOT=${HF_ROOT:-$(readlink -f /raid/huggingface)}
-# ANCHOR (a path inside the container) and PROMPT default to the AMD GPU keynote
-# scene in assets/amd_gpu_keynote.{jpg,txt}; set both to stream something else.
+# ANCHOR (a path inside the container) and PROMPT default to the AMD AI keynote
+# scene in assets/amd_ai_keynote.{jpg,txt}; set both to stream something else.
 ANCHOR=${ANCHOR:-}
 PROMPT=${PROMPT:-}
 NAME=${NAME:-yatholam-xdit-stream-runner-$(date +%Y%m%d)}
@@ -46,6 +53,10 @@ REPLACE=${REPLACE:-0}
 DRY_RUN=${DRY_RUN:-0}
 OUT_DIR=${OUT_DIR:-$HOME/phantom/h3_stream_out}
 mkdir -p "$OUT_DIR"
+# Distilled lightx2v Turbo LoRA (few-step sampling). TURBO=8 or 4 picks the
+# matching adapter from TURBO_LORA_HOST (mounted read-only at /turbo_lora); the
+# in-container launcher sets H3_TURBO_LORA and drops STEPS to match.
+TURBO_LORA_HOST=${TURBO_LORA_HOST:-$HOME/phantom/turbo_lora}
 
 # ---- idle check (CPU <=80%, every GPU <=5% util AND <=20% VRAM) ----
 wait_for_idle() {
@@ -126,15 +137,19 @@ RUN=(docker run -it --rm --name "$NAME"
     ${ANCHOR:+-e "ANCHOR=$ANCHOR"} ${PROMPT:+-e "PROMPT=$PROMPT"} ${PROMPT_FILE:+-e "PROMPT_FILE=$PROMPT_FILE"}
     -e NPROC="$NPROC" -e PORT="$PORT"
     -e OVERLAY="${OVERLAY:-0}" -e COND_COLOR_MATCH="${COND_COLOR_MATCH:-anchor_mean}"
-    -e CUT_IN="${CUT_IN:-1}" -e AREA="${AREA:-522240}"
+    -e CUT_IN="${CUT_IN:-1}" ${AREA:+-e "AREA=$AREA"}
+    ${MODEL:+-e "MODEL=$MODEL"} ${NUM_FRAMES:+-e "NUM_FRAMES=$NUM_FRAMES"}
+    ${PROMPT_FALLBACK:+-e "PROMPT_FALLBACK=$PROMPT_FALLBACK"} ${PROMPT_ENHANCER:+-e "PROMPT_ENHANCER=$PROMPT_ENHANCER"}
     -e CRF="${CRF:-23}" -e MAX_KBPS="${MAX_KBPS:-3000}"
     -e ENHANCER_MAX_NEW_TOKENS="${ENHANCER_MAX_NEW_TOKENS:-384}"
     -e MAX_AHEAD_CHUNKS="${MAX_AHEAD_CHUNKS:-4}"
     -e DEMO="${DEMO:-0}" -e DEMO_INTERVAL_S="${DEMO_INTERVAL_S:-30}" ${DEMO_CAST+-e "DEMO_CAST=$DEMO_CAST"}
     -e FAKE_GENERATOR="${FAKE_GENERATOR:-0}" -e CLI="${CLI:-0}"
+    ${TURBO:+-e "TURBO=$TURBO"} ${STEPS:+-e "STEPS=$STEPS"} -e TURBO_LORA_DIR=/turbo_lora
     ${WIDTH:+-e WIDTH="$WIDTH"} ${HEIGHT:+-e HEIGHT="$HEIGHT"}
     -e OUTPUT_DIR=/output/stream
     -v "$SRC":/workspace/xDiT -v "$HF_ROOT":/raid/huggingface -v "$OUT_DIR":/output/stream
+    ${TURBO:+-v "$TURBO_LORA_HOST":/turbo_lora:ro}
     -w /workspace/xDiT
     -p 127.0.0.1:"$PORT":"$PORT"
     "$IMAGE"

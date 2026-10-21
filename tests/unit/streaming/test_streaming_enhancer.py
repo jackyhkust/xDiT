@@ -2,7 +2,13 @@ import numpy as np
 import pytest
 import torch
 
-from xfuser.streaming.enhancer import I2VA_HEADER, PromptEnhancer, parse_enhanced
+from xfuser.streaming.enhancer import (
+    I2VA_HEADER,
+    LTX_LIVE_STREAM_RULES,
+    LtxPromptEnhancer,
+    PromptEnhancer,
+    parse_enhanced,
+)
 
 _GOOD = """\
 Sure, here you go.
@@ -68,6 +74,67 @@ def test_static_fallback_without_user_text_keeps_current():
     result = PromptEnhancer.fallback("current scene", "")
     assert result.transition == "current scene"
     assert not result.ok
+
+
+def test_replace_fallback_drops_the_old_prompt_and_its_dialogue():
+    opening = 'She says, "AMD powers the AI data center."'
+
+    appended = PromptEnhancer.fallback(opening, "A robot rolls in.")
+    replaced = PromptEnhancer.fallback(opening, "  A robot rolls in. ", replace=True)
+
+    assert opening in appended.transition and "A robot rolls in." in appended.transition
+    assert "AMD powers" not in replaced.transition
+    assert replaced.transition == replaced.continuation
+    assert replaced.transition.endswith(" A robot rolls in.")
+    assert "without any cut" in replaced.transition
+
+
+class _LtxPipe:
+    def __init__(self, reply):
+        self.prompt_enhancer = object()
+        self.processor = object()
+        self.transformer = torch.nn.Linear(1, 1)
+        self.reply = reply
+        self.calls = []
+
+    def enhance_prompt(self, **kwargs):
+        self.calls.append(kwargs)
+        return [self.reply]
+
+
+def test_ltx_enhancer_rewrites_the_request_from_the_frame():
+    pipe = _LtxPipe("  A small white robot rolls in beside her.  ")
+    enhancer = LtxPromptEnhancer(pipe, max_new_tokens=300)
+    frame = np.full((4, 6, 3), 200, dtype=np.uint8)
+
+    result = enhancer.enhance("opening", "current", " A robot rolls in. ", frame)
+
+    assert result.ok and result.transition == result.continuation == "A small white robot rolls in beside her."
+    call = pipe.calls[0]
+    assert call["prompt"] == "A robot rolls in."
+    assert call["max_new_tokens"] == 300
+    assert call["image"].size == (6, 4) and call["image"].mode == "RGB"
+    assert call["system_prompt"].endswith(LTX_LIVE_STREAM_RULES)
+
+
+def test_ltx_enhancer_falls_back_to_the_raw_request_on_empty_output():
+    enhancer = LtxPromptEnhancer(_LtxPipe("   "))
+
+    result = enhancer.enhance("opening", 'She says, "old line."', "A robot rolls in.", np.zeros((2, 2, 3), np.uint8))
+
+    assert not result.ok
+    assert "old line" not in result.transition and result.transition.endswith("A robot rolls in.")
+
+
+def test_ltx_enhancer_needs_the_bundled_components():
+    pipe = _LtxPipe("x")
+    pipe.prompt_enhancer = None
+    with pytest.raises(ValueError):
+        LtxPromptEnhancer(pipe)
+
+
+def test_replace_fallback_without_user_text_keeps_current():
+    assert PromptEnhancer.fallback("current scene", " ", replace=True).transition == "current scene"
 
 
 class _FakeProcessor:

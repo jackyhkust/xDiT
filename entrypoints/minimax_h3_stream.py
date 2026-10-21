@@ -12,6 +12,13 @@ streamer first: it clears the stream directory on startup.
         --attention_backend aiter_bf16 --use_fp8_gemms --ulysses_degree 8 \\
         --use_parallel_vae --use_torch_compile --stream_dir /dev/shm/h3_stream
 
+LTX-2.5 distilled streams the same way (``--model LTX-2.5-distilled --task i2v
+--num_frames 121 --num_inference_steps 8``; 48 kHz audio, so start the streamer
+with ``--sample_rate 48000``). Viewer prompts are rewritten by its bundled
+Gemma 4 prompt enhancer (``--prompt_enhancer gemma4``) into one caption that
+starts from the current frame; with ``--prompt_enhancer none
+--prompt_fallback replace`` the raw text replaces the opening prompt instead.
+
 Viewers change the scene at runtime with
 ``python -m xfuser.streaming.prompt_cli --stream_dir /dev/shm/h3_stream``. Each
 new prompt is rewritten by the model's own Qwen3-VL conditioner, using the last
@@ -46,9 +53,10 @@ from xfuser.core.utils.runner_utils import is_last_process, log
 from xfuser.runner import setup_logging, xFuserModelRunner
 from xfuser.streaming.chunks import Chunk, mark_done, read_position, write_chunk, write_cut
 from xfuser.streaming.color import match_color_stats
-from xfuser.streaming.enhancer import PromptEnhancer
+from xfuser.streaming.enhancer import LtxPromptEnhancer, PromptEnhancer
 from xfuser.streaming.history import FrameHistory
 from xfuser.streaming.local_snapshot import localize_modular_components, resolve_local_snapshot
+from xfuser.streaming.model_io import chunk_media, with_condition
 from xfuser.streaming.resolution import cover_resize, upright
 from xfuser.streaming.prompt_queue import (
     STATE_ENHANCING,
@@ -90,11 +98,21 @@ def build_parser() -> FlexibleArgumentParser:
     group.add_argument("--cond_color_strength", type=float, default=0.5)
     group.add_argument(
         "--prompt_enhancer",
-        choices=["qwen3vl", "none"],
+        choices=["qwen3vl", "gemma4", "none"],
         default="qwen3vl",
         help=(
-            "How to turn a viewer's prompt into an I2VA prompt: 'qwen3vl' rewrites it with the model's own "
-            "conditioner using the last frame; 'none' appends the raw text to the current prompt."
+            "How to turn a viewer's prompt into a model prompt using the frame it starts from: 'qwen3vl' "
+            "rewrites it with MiniMax-H3's own conditioner; 'gemma4' with LTX-2.5's bundled prompt enhancer; "
+            "'none' uses the raw text (see --prompt_fallback)."
+        ),
+    )
+    group.add_argument(
+        "--prompt_fallback",
+        choices=["append", "replace"],
+        default="append",
+        help=(
+            "Without the enhancer: 'append' adds the viewer's text to the opening prompt; 'replace' uses the "
+            "viewer's text alone (with a continuity line), so the opening prompt's dialogue is not spoken again."
         ),
     )
     group.add_argument(
@@ -203,7 +221,7 @@ def main() -> None:
             f"The anchor is {image_w}x{image_h} but the canvas is {width}x{height}; it is center-cropped. "
             "Pick a canvas with the anchor's aspect ratio (xfuser/streaming/resolution.py) to keep all of it."
         )
-    input_args["input_images"] = [anchor_image]
+    input_args = with_condition(input_args, anchor_image)
     anchor = np.asarray(anchor_image)
 
     # Viewer prompts change the text length; compile one graph for all lengths.
@@ -218,7 +236,15 @@ def main() -> None:
 
     # Prompt enhancer (reuses the resident Qwen3-VL conditioner on the writer rank).
     enhancer = None
-    if args["prompt_enhancer"] == "qwen3vl":
+    if args["prompt_enhancer"] == "qwen3vl" and model.config.task != "i2va":
+        log(f"Prompt enhancement disabled: it writes MiniMax-H3 I2VA prompts, not {model.config.task} prompts.")
+    elif args["prompt_enhancer"] == "gemma4":
+        try:
+            enhancer = LtxPromptEnhancer(model.pipe, max_new_tokens=args["enhancer_max_new_tokens"])
+            log("Prompt enhancement enabled (LTX-2.5 Gemma 4).")
+        except ValueError as error:
+            log(f"Prompt enhancement disabled: {error}")
+    elif args["prompt_enhancer"] == "qwen3vl":
         try:
             enhancer = PromptEnhancer(
                 model.pipe,
@@ -242,6 +268,11 @@ def main() -> None:
     )
 
     original_prompt = input_args["prompt"]
+    # Some runners (LTX-2.5) keep --prompt as a list; prompt edits work on one string.
+    if isinstance(original_prompt, list):
+        if len(original_prompt) != 1:
+            raise ValueError(f"Streaming needs exactly one --prompt, got {len(original_prompt)}.")
+        original_prompt = original_prompt[0]
     current_prompt = original_prompt
     pending_continuation = None
     transition_remaining = 0
@@ -323,7 +354,11 @@ def main() -> None:
                     enh_payload = None
                 enh_payload = _broadcast_from_writer(enh_payload)
             else:
-                fallback = PromptEnhancer.fallback(current_prompt, active_user_text)
+                # Build on the original prompt, not the current one, so the text does not
+                # grow by one request per prompt over a long stream.
+                fallback = PromptEnhancer.fallback(
+                    original_prompt, active_user_text, replace=args["prompt_fallback"] == "replace"
+                )
                 enh_payload = {
                     "transition": fallback.transition,
                     "continuation": fallback.continuation,
@@ -391,14 +426,12 @@ def main() -> None:
 
         loop_start = time.perf_counter()
         chunk_args = dict(
-            input_args,
+            with_condition(input_args, condition),
             prompt=current_prompt,
-            input_images=[condition],
             seed=input_args["seed"] + index,
         )
         output, gen_time = model._run_timed_pipe(chunk_args)
-        frames = output.videos[0].numpy()
-        audio = output.audio[0].float().cpu().numpy() if output.audio is not None else None
+        frames, audio, sample_rate = chunk_media(model, output)
 
         last_raw = _shared_condition(frames[-1])
         # The last transition chunk defines the new scene's look. Re-base the color
@@ -423,7 +456,7 @@ def main() -> None:
                     index=index,
                     frames=frames,
                     audio=audio,
-                    sample_rate=output.audio_sample_rate,
+                    sample_rate=sample_rate,
                     fps=fps,
                     meta={
                         "gen_time_s": round(gen_time, 4),
