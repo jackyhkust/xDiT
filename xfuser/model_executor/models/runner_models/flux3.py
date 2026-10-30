@@ -77,6 +77,7 @@ class _Flux3Model(xFuserModel):
         use_cfg_parallel=False,
         use_fp8_gemms=True,
         use_fp4_gemms=True,
+        use_hybrid_gemm_schedule=True,
         use_fp8_comms=True,
         fully_shard_degree=True,
         enable_tiling=True,
@@ -304,6 +305,12 @@ class xFuserFlux3KleinBaseModel(_Flux3Model):
         model_name="black-forest-labs/flux-3-image-klein-base",
         output_name="flux_3_image_klein_base",
     )
+
+    def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
+        # Without CFG parallel the guider calls the transformer once per branch.
+        if input_args["guidance_scale"] > 1.0 and not self.config.use_cfg_parallel:
+            return 2
+        return 1
 
     def _validate_args(self, input_args: dict) -> None:
         super()._validate_args(input_args)

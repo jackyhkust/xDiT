@@ -12,6 +12,7 @@ from diffusers.models.transformers.transformer_flux3 import (
 )
 
 from xfuser.core.distributed import (
+    get_runtime_state,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
 )
@@ -135,6 +136,9 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
             for block in blocks:
                 block.attn.processor = processor
         register_fp8_comms_eligible_modules(self, flux3_attn_modules(self))
+        # One transformer call per scheduled step: the hybrid GEMM and attention schedules
+        # pick the step's precision before the blocks run.
+        self.register_forward_pre_hook(lambda module, args: get_runtime_state().increment_step_counter())
 
     @staticmethod
     def _shard(
