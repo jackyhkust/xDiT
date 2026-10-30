@@ -73,6 +73,21 @@ def test_cfg_parallel_without_guidance_is_refused(build_flux3):
         model._validate_args(_args(guidance_scale=1.0))
 
 
+@pytest.mark.parametrize(
+    ("name", "config", "guidance_scale", "calls_per_step"),
+    [
+        ("FLUX.3-image-klein", {}, None, 1),
+        ("FLUX.3-image-klein-base", {}, 3.5, 2),
+        ("FLUX.3-image-klein-base", {"use_cfg_parallel": True}, 3.5, 1),
+        ("FLUX.3-image-klein-base", {}, 1.0, 1),
+    ],
+)
+def test_hybrid_schedules_count_every_transformer_call(build_flux3, name, config, guidance_scale, calls_per_step):
+    model = build_flux3(name, **config)
+
+    assert model._calculate_hybrid_attention_step_multiplier(_args(guidance_scale=guidance_scale)) == calls_per_step
+
+
 def test_negative_prompt_is_refused(build_flux3):
     model = build_flux3()
 

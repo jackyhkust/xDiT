@@ -440,6 +440,7 @@ A listed target is only half the answer: the format still has to survive the har
 | Model family | FP4 targets | INT8 targets |
 |--------------|-------------|--------------|
 | FLUX.2 | `transformer.transformer_blocks` and `transformer.single_transformer_blocks` | No |
+| FLUX.3 Image klein and klein base | `transformer.txt_mode_blocks`, `transformer.mode_blocks` and `transformer.single_transformer_blocks` | No |
 | Wan 2.1/2.2 I2V and T2V, Wan 2.2 TI2V | `transformer.blocks`; on dual-transformer Wan 2.2 that covers `transformer` while all of `transformer_2` stays FP8 | No |
 | Wan 2.2 Distilled I2V | The same split, inherited from Wan 2.2 I2V and applied post-load | No |
 | Krea2-Raw and Krea2-Turbo | `transformer.transformer_blocks` | No |
@@ -447,7 +448,7 @@ A listed target is only half the answer: the format still has to survive the har
 | MiniMax-H3 | `transformer.transformer_blocks`; the Ref2VA variant declares `transformer_ref.transformer_blocks` | No |
 | Cosmos3-Super and Cosmos3-Nano | `transformer.layers` | No |
 | Z-Image and Z-Image-Turbo | No | `transformer.layers`, `transformer.noise_refiner`, and `transformer.context_refiner`; `context_refiner` drops out under sequence parallelism |
-| FLUX.1, FLUX.1-Kontext, FLUX.2-klein, FLUX.3 Image klein and klein base, Wan 2.1 VACE, Qwen-Image variants, Stable Diffusion 3.5, HunyuanVideo variants, LTX variants, CausalWan, Prism, VDN-H3 | No | No |
+| FLUX.1, FLUX.1-Kontext, FLUX.2-klein, Wan 2.1 VACE, Qwen-Image variants, Stable Diffusion 3.5, HunyuanVideo variants, LTX variants, CausalWan, Prism, VDN-H3 | No | No |
 
 Several runners hold part of an FP4 target at FP8 where full FP4 costs too much
 quality: Wan 2.1 I2V and T2V keep blocks 0-9 and 30-39, Wan 2.2 TI2V keeps
