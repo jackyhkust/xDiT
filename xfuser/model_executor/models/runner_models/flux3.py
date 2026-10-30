@@ -83,6 +83,7 @@ class _Flux3Model(xFuserModel):
         enable_tiling=True,
         enable_slicing=True,
         use_parallel_vae=True,
+        vae_dtype=True,
     )
     # Shared by both checkpoints, which add their model and output names with replace().
     settings = ModelSettings(
@@ -153,8 +154,9 @@ class _Flux3Model(xFuserModel):
         # By name: the checkpoints also list the prompt upsampler, a separate 9B model.
         pipe.load_components(names=["text_encoder", "tokenizer"], dtype=torch.bfloat16)
         trim_text_encoder(pipe.text_encoder, _deepest_text_encoder_layer(pipe.blocks))
-        # The VAE runs in fp32, as in BFL's reference and the diffusers FLUX.3 docs.
-        pipe.load_components(names=["vae"], dtype=torch.float32)
+        # The VAE runs in fp32 by default, as in BFL's reference and the diffusers FLUX.3 docs.
+        vae_dtype = torch.bfloat16 if self.config.vae_dtype == "bf16" else torch.float32
+        pipe.load_components(names=["vae"], dtype=vae_dtype)
         return pipe
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
