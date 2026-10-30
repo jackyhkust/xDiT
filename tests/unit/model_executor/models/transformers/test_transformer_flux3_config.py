@@ -49,3 +49,67 @@ def test_each_transformer_call_advances_the_step_schedule(monkeypatch):
         hook(wrapper, ())
 
     assert len(calls) == 1
+
+
+def test_fusing_stacks_the_four_input_projections_of_every_block():
+    import torch
+
+    wrapper = transformer_flux3.xFuserFlux3Transformer2DWrapper(**TINY, flow_map=True)
+    block = wrapper.single_transformer_blocks[0]
+    layers = (block.attn.to_q, block.attn.to_k, block.attn.to_v, block.ff.linear_in)
+    x = torch.randn(3, layers[0].in_features)
+    expected = torch.cat([layer(x) for layer in layers], dim=-1)
+
+    assert transformer_flux3.fuse_block_input_projections(wrapper) == 4
+
+    assert type(block).__name__ == "_FusedFlux3SingleTransformerBlock"
+    assert block.fused_in_split == [layer.out_features for layer in layers]
+    assert not hasattr(block.attn, "to_q") and not hasattr(block.ff, "linear_in")
+    torch.testing.assert_close(block.fused_in(x), expected)
+    assert type(wrapper.mode_blocks["image"][0]).__name__ == "_FusedFlux3ModeTransformerBlock"
+
+
+def test_fusing_skips_blocks_whose_layers_cannot_be_stacked():
+    import torch
+
+    wrapper = transformer_flux3.xFuserFlux3Transformer2DWrapper(**TINY, flow_map=True)
+    block = wrapper.txt_mode_blocks[0]
+    block.attn.to_k = torch.nn.Linear(block.attn.to_k.in_features, block.attn.to_k.out_features, bias=True)
+
+    assert transformer_flux3.fuse_block_input_projections(wrapper) == 3
+    assert type(block).__name__ == "Flux3ModeTransformerBlock"
+    assert hasattr(block.attn, "to_q")
+
+
+@pytest.mark.parametrize(
+    ("start", "length", "expected_rows"),
+    [
+        (0, 4, [0, 0, 0, 0]),  # image only
+        (4, 4, [0, 0, 1, 1]),  # straddles image and reference
+        (8, 4, [1, 1, 1, 1]),  # reference, then SP pad
+        (2, 0, []),  # a rank holding only text
+    ],
+)
+def test_content_modulation_gives_each_position_its_stream_row(start, length, expected_rows):
+    import torch
+
+    wrapper = transformer_flux3.xFuserFlux3Transformer2DWrapper(**TINY, flow_map=True)
+    rows = [torch.full((1, 1, 3), float(index)) for index in range(2)]
+
+    mod = wrapper._content_modulation(rows, [6, 4], start=start, length=length)
+
+    assert mod.shape == (1, length, 3)
+    assert mod[0, :, 0].tolist() == expected_rows
+
+
+def test_block_inputs_keep_one_address_per_shape():
+    import torch
+
+    wrapper = transformer_flux3.xFuserFlux3Transformer2DWrapper(**TINY, flow_map=True)
+    first = wrapper._block_input("joint.cos", torch.ones(4, 2))
+    second = wrapper._block_input("joint.cos", torch.zeros(4, 2))
+    other_shape = wrapper._block_input("joint.cos", torch.zeros(5, 2))
+
+    assert second.data_ptr() == first.data_ptr() and torch.equal(second, torch.zeros(4, 2))
+    assert other_shape.data_ptr() != first.data_ptr()
+    assert getattr(first, "_dynamo_static_input_type", None) == "unguarded"

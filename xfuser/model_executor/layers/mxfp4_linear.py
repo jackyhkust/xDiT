@@ -121,6 +121,33 @@ class xFuserMXFP4Linear(nn.Module):
         delattr(self, 'weight')
         self.register_parameter('weight', None)
 
+    @classmethod
+    def concatenated(cls, layers) -> "xFuserMXFP4Linear":
+        """One layer computing ``torch.cat([layer(x) for layer in layers], dim=-1)``.
+
+        The per-1x32 weight quantization and the 16x16 preshuffle are local to each
+        weight row block, so the packed weights and scales of layers with the same
+        input can be stacked along N without requantizing.
+        """
+        in_features = layers[0].in_features
+        if any(layer.in_features != in_features or layer.bias is not None for layer in layers):
+            raise ValueError("Only bias-free MXFP4 layers with the same input width can be concatenated.")
+        if any(not hasattr(layer, "weight_shuffle") for layer in layers):
+            raise ValueError("Quantize the MXFP4 layers before concatenating them.")
+        fused = cls.__new__(cls)
+        nn.Module.__init__(fused)
+        fused.in_features = in_features
+        fused.out_features = sum(layer.out_features for layer in layers)
+        fused.register_parameter("weight", None)
+        fused.register_parameter("bias", None)
+        fused.register_parameter(
+            "weight_shuffle",
+            nn.Parameter(torch.cat([layer.weight_shuffle for layer in layers]), requires_grad=False),
+        )
+        fused.register_buffer("weight_scale", torch.cat([layer.weight_scale for layer in layers]), persistent=True)
+        fused.mm = fused._run_mxfp4_gemm
+        return fused
+
     def _is_fsdp_managed_parameter(self, parameter) -> bool:
         """Whether replacing ``parameter`` would break composable FSDP ownership."""
         try:

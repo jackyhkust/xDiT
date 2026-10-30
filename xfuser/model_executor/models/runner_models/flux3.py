@@ -159,7 +159,18 @@ class _Flux3Model(xFuserModel):
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
         super()._post_load_and_state_initialization(input_args)
+        self._fuse_block_input_projections()
         self._expose_transformer_signature()
+
+    def _fuse_block_input_projections(self) -> None:
+        # After the loader's FP8/FP4 swaps, which decide what can be stacked, and before
+        # compile. FSDP shards the separate weights, so sharded runs keep them.
+        if self.config.fully_shard_degree > 1:
+            return
+        from xfuser.model_executor.models.transformers.transformer_flux3 import fuse_block_input_projections
+
+        fused = fuse_block_input_projections(self.pipe.transformer)
+        log(f"FLUX.3: one input GEMM for q, k, v and the feed-forward in {fused} blocks")
 
     def _expose_transformer_signature(self) -> None:
         """Show the denoise step the transformer's real forward parameters.
