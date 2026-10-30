@@ -1,5 +1,7 @@
 """FLUX.3 sequence- and CFG-parallel parity against stock diffusers on tiny random transformers."""
 
+import itertools
+
 import pytest
 
 pytest.importorskip(
@@ -130,9 +132,12 @@ def _sp_worker(rank, world_size, init_method, ulysses_degree, ring_degree):
     from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
 
     try:
+        from xfuser.model_executor.models.transformers.transformer_flux3 import fuse_block_input_projections
+
         device = _setup(rank, world_size, init_method, ulysses_degree, ring_degree)
         stock = _tiny_model(device)
-        wrapper = _wrapper_of(stock, device)
+        wrappers = {"separate": _wrapper_of(stock, device), "fused": _wrapper_of(stock, device)}
+        assert fuse_block_input_projections(wrappers["fused"]) == 2 + 2 + 2 + 2
 
         for layout in LAYOUTS:
             for with_references in (False, True):
@@ -140,7 +145,7 @@ def _sp_worker(rank, world_size, init_method, ulysses_degree, ring_degree):
                 with torch.no_grad():
                     reference = stock(**inputs).sample
                 # The text stream either runs whole on every rank or is sharded.
-                for replicate_text in (True, False):
+                for (projections, wrapper), replicate_text in itertools.product(wrappers.items(), (True, False)):
                     wrapper.replicate_text_max_tokens = 512 if replicate_text else 0
                     with torch.no_grad():
                         actual = wrapper(**inputs).sample
@@ -151,7 +156,8 @@ def _sp_worker(rank, world_size, init_method, ulysses_degree, ring_degree):
                         atol=1e-4,
                         msg=lambda m: (
                             f"Ulysses {ulysses_degree} x ring {ring_degree}, {layout} layout, "
-                            f"references={with_references}, replicated text={replicate_text}: {m}"
+                            f"references={with_references}, replicated text={replicate_text}, "
+                            f"{projections} input projections: {m}"
                         ),
                     )
     finally:
