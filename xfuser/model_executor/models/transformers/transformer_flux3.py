@@ -292,6 +292,7 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
                 block.attn.processor = processor
         register_fp8_comms_eligible_modules(self, flux3_attn_modules(self))
         self._block_input_buffers: Dict[tuple, torch.Tensor] = {}
+        self._step_constants: Dict[str, tuple] = {}
         # One transformer call per scheduled step: the hybrid GEMM and attention schedules
         # pick the step's precision before the blocks run.
         self.register_forward_pre_hook(lambda module, args: get_runtime_state().increment_step_counter())
@@ -313,6 +314,26 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
             self._block_input_buffers[key] = buffer
         buffer.copy_(tensor)
         return buffer
+
+    def _step_constant(self, name: str, source: torch.Tensor, compute) -> Any:
+        """``compute(source)``, reused while the steps pass the same, unmodified ``source``.
+
+        The denoise loop hands every step of a call the same ids and prompt embeddings, so
+        their RoPE tables (built in float64 from many small kernels) and text projection need
+        computing once per call. The entry holds ``source``, so a later tensor cannot
+        reuse its identity; in-place writes bump its version. Inference tensors have no
+        version counter, so for them identity alone decides: the pipeline never writes its
+        conditioning in place. Autograd always recomputes.
+        """
+        if torch.is_grad_enabled():
+            return compute(source)
+        version = None if source.is_inference() else source._version
+        cached = self._step_constants.get(name)
+        if cached is not None and cached[0] is source and cached[1] == version:
+            return cached[2]
+        result = compute(source)
+        self._step_constants[name] = (source, version, result)
+        return result
 
     def _modulation(self, name: str, mod_row: torch.Tensor, seq_len: int) -> torch.Tensor:
         """The (batch, seq_len, 3 * dim) modulation of a mode whose tokens share one row."""
@@ -405,20 +426,20 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
         # one row and broadcast instead of on every token of every rank.
         txt_early_mod = self.early_stream_modulations["txt"](zero_temb_act)
         txt_single_mod = self.single_stream_modulations["txt"](zero_temb_act)
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-        txt_rotary_emb = self.pos_embed(txt_ids)
+        encoder_hidden_states = self._step_constant("context", encoder_hidden_states, self.context_embedder)
+        txt_rotary_emb = self._step_constant("txt_ids", txt_ids, self.pos_embed)
 
         image_temb_act = F.silu(image_temb)
         image_early_mod = self.early_stream_modulations["image"](image_temb_act)
         image_single_mod = self.single_stream_modulations["image"](image_temb_act)
         hidden_states = self.x_embedders["image"](hidden_states)
-        image_rotary_emb = self.pos_embed(img_ids)
+        image_rotary_emb = self._step_constant("img_ids", img_ids, self.pos_embed)
 
         if image_cond_hidden_states is not None:
             cond_early_mod = self.early_stream_modulations["image_cond"](zero_temb_act)
             cond_single_mod = self.single_stream_modulations["image_cond"](zero_temb_act)
             image_cond_hidden_states = self.x_embedders["image_cond"](image_cond_hidden_states)
-            cond_rotary_emb = self.pos_embed(image_cond_ids)
+            cond_rotary_emb = self._step_constant("image_cond_ids", image_cond_ids, self.pos_embed)
 
         # 5. Per-mode blocks, each mode attended on its own; short text runs whole on every rank.
         replicate_text = (

@@ -113,3 +113,30 @@ def test_block_inputs_keep_one_address_per_shape():
     assert second.data_ptr() == first.data_ptr() and torch.equal(second, torch.zeros(4, 2))
     assert other_shape.data_ptr() != first.data_ptr()
     assert getattr(first, "_dynamo_static_input_type", None) == "unguarded"
+
+
+def test_step_constants_recompute_for_a_new_or_modified_source():
+    import torch
+
+    wrapper = transformer_flux3.xFuserFlux3Transformer2DWrapper(**TINY, flow_map=True)
+    calls = []
+
+    def compute(x):
+        calls.append(1)
+        return x * 2
+
+    ids = torch.ones(3)
+    with torch.no_grad():
+        first = wrapper._step_constant("ids", ids, compute)
+        assert wrapper._step_constant("ids", ids, compute) is first and len(calls) == 1
+        ids.add_(1)
+        assert torch.equal(wrapper._step_constant("ids", ids, compute), torch.full((3,), 4.0)) and len(calls) == 2
+        wrapper._step_constant("ids", torch.ones(3), compute)
+        assert len(calls) == 3
+    wrapper._step_constant("ids", ids, compute)
+    wrapper._step_constant("ids", ids, compute)
+    assert len(calls) == 5
+    with torch.inference_mode():
+        inference_ids = torch.ones(3)
+        first = wrapper._step_constant("ids", inference_ids, compute)
+        assert wrapper._step_constant("ids", inference_ids, compute) is first and len(calls) == 6
