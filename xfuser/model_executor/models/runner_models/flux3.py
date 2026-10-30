@@ -76,6 +76,7 @@ class _Flux3Model(xFuserModel):
         ring_degree=True,
         use_cfg_parallel=False,
         use_fp8_gemms=True,
+        use_fp4_gemms=True,
         use_fp8_comms=True,
         fully_shard_degree=True,
         enable_tiling=True,
@@ -87,6 +88,11 @@ class _Flux3Model(xFuserModel):
         model_output_type="image",
         mod_value=16,
         fp8_gemm_module_list=[
+            "transformer.txt_mode_blocks",
+            "transformer.mode_blocks",
+            "transformer.single_transformer_blocks",
+        ],
+        fp4_gemm_module_list=[
             "transformer.txt_mode_blocks",
             "transformer.mode_blocks",
             "transformer.single_transformer_blocks",
