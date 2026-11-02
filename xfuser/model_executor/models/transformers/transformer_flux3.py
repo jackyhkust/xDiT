@@ -23,12 +23,22 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_world_size,
 )
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
+from xfuser.model_executor.layers import mxfp4_fused_quant
+from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear
 from xfuser.model_executor.layers import usp_sdma
 from xfuser.model_executor.layers.usp import PROCESS_GROUP, USP, attention, seq_major_attention_output, ulysses_aiter_attention
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
     gather_and_unpad,
 )
+
+
+# The FP4 GEMM inputs are quantized by the kernels producing them (see mxfp4_fused_quant).
+FUSED_MXFP4_QUANT = True
+
+
+def _takes_quantized_input(layer: torch.nn.Module) -> bool:
+    return FUSED_MXFP4_QUANT and mxfp4_fused_quant.MXFP4_FUSED_QUANT_AVAILABLE and type(layer) is xFuserMXFP4Linear
 
 
 class xFuserFlux3AttnProcessor:
@@ -89,7 +99,13 @@ class xFuserFlux3AttnProcessor:
 
         if self._uses_seq_major_ulysses(attn):
             received = ulysses_aiter_attention(query, key, value, self.valid_kv_len)
-            return attn.to_out[1](attn.to_out[0](seq_major_attention_output(received)))
+            if _takes_quantized_input(attn.to_out[0]):
+                _, seq_len, batch, _, _ = received.shape
+                quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(received)
+                hidden_states = attn.to_out[0].forward_quantized(*quantized, (batch, seq_len))
+            else:
+                hidden_states = attn.to_out[0](seq_major_attention_output(received))
+            return attn.to_out[1](hidden_states)
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
@@ -168,12 +184,29 @@ def flux3_attn_modules(transformer) -> list[torch.nn.Module]:
     return [block.attn for block in blocks]
 
 
-def _fused_attention_and_ff(block, norm_hidden_states, image_rotary_emb):
-    """The block's attention and feed-forward outputs from one shared input GEMM."""
-    query, key, value, ff_hidden = block.fused_in(norm_hidden_states).split(block.fused_in_split, dim=-1)
+def _fused_attention_and_ff(block, projected, image_rotary_emb):
+    """The block's attention and feed-forward outputs from its shared input GEMM's output."""
+    query, key, value, ff_hidden = projected.split(block.fused_in_split, dim=-1)
     attn_output = block.attn.processor.attend(block.attn, query, key, value, image_rotary_emb)
-    ff_output = block.ff.linear_out(block.ff.act_fn(ff_hidden))
+    if _takes_quantized_input(block.ff.linear_out):
+        quantized = torch.ops.xfuser.swiglu_mxfp4_quant(ff_hidden)
+        ff_output = block.ff.linear_out.forward_quantized(*quantized, ff_hidden.shape[:-1])
+    else:
+        ff_output = block.ff.linear_out(block.ff.act_fn(ff_hidden))
     return attn_output, ff_output
+
+
+def _modulated_input_projection(block, segments):
+    """``block.fused_in`` of the concatenated ``(1 + scale) * norm(x) + shift`` of each
+    ``(x, shift, scale)`` segment, all ``[b, s_i, dim]``, concatenated along the sequence."""
+    segments = [segment for segment in segments if segment[0].shape[1]]
+    if _takes_quantized_input(block.fused_in):
+        flat = [tensor for segment in segments for tensor in segment]
+        quantized = torch.ops.xfuser.layernorm_modulate_mxfp4_quant(*flat[:3], block.norm.eps, *flat[3:])
+        seq_len = sum(segment[0].shape[1] for segment in segments)
+        return block.fused_in.forward_quantized(*quantized, (segments[0][0].shape[0], seq_len))
+    normed = [(1 + scale) * block.norm(x) + shift for x, shift, scale in segments]
+    return block.fused_in(normed[0] if len(normed) == 1 else torch.cat(normed, dim=1))
 
 
 class _FusedFlux3ModeTransformerBlock(Flux3ModeTransformerBlock):
@@ -181,11 +214,8 @@ class _FusedFlux3ModeTransformerBlock(Flux3ModeTransformerBlock):
 
     def forward(self, hidden_states, temb_mod, image_rotary_emb):
         mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
-
-        norm_hidden_states = self.norm(hidden_states)
-        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
-
-        attn_output, ff_output = _fused_attention_and_ff(self, norm_hidden_states, image_rotary_emb)
+        projected = _modulated_input_projection(self, [(hidden_states, mod_shift, mod_scale)])
+        attn_output, ff_output = _fused_attention_and_ff(self, projected, image_rotary_emb)
         return hidden_states + mod_gate * (attn_output + ff_output)
 
 
@@ -196,14 +226,11 @@ class _FusedFlux3SingleTransformerBlock(Flux3SingleTransformerBlock):
         mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
         c_mod_shift, c_mod_scale, c_mod_gate = torch.chunk(temb_mod_context, 3, dim=-1)
 
-        norm_hidden_states = self.norm(hidden_states)
-        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
-
-        norm_encoder_hidden_states = self.norm(encoder_hidden_states)
-        norm_encoder_hidden_states = (1 + c_mod_scale) * norm_encoder_hidden_states + c_mod_shift
-
-        combined = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
-        attn_output, ff_output = _fused_attention_and_ff(self, combined, image_rotary_emb)
+        projected = _modulated_input_projection(
+            self,
+            [(encoder_hidden_states, c_mod_shift, c_mod_scale), (hidden_states, mod_shift, mod_scale)],
+        )
+        attn_output, ff_output = _fused_attention_and_ff(self, projected, image_rotary_emb)
         output = attn_output + ff_output
 
         context_output, content_output = torch.split(
@@ -223,8 +250,6 @@ _FUSED_BLOCK_CLASSES = {
 def _concatenated_linear(layers) -> Optional[torch.nn.Module]:
     """One layer equal to the given layers' outputs concatenated, or None if their kind
     cannot be stacked (FP8 tensor subclasses, the hybrid FP4 layer, bias)."""
-    from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear
-
     if all(type(layer) is xFuserMXFP4Linear for layer in layers):
         return xFuserMXFP4Linear.concatenated(layers)
     plain = all(
