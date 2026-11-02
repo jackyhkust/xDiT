@@ -140,3 +140,37 @@ def test_step_constants_recompute_for_a_new_or_modified_source():
         inference_ids = torch.ones(3)
         first = wrapper._step_constant("ids", inference_ids, compute)
         assert wrapper._step_constant("ids", inference_ids, compute) is first and len(calls) == 6
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({}, True),
+        ({"local": True}, False),
+        ({"ulysses": 1}, False),
+        ({"ring": 2}, False),
+        ({"heads": 6}, False),  # not divisible by the Ulysses degree
+        ({"backend": "AITER_FP8"}, False),
+        ({"fp8_comms": object()}, False),
+        ({"capture_bypass": True}, False),
+        ({"disabled": True}, False),
+    ],
+)
+def test_only_plain_ulysses_aiter_attention_takes_the_seq_major_exchange(monkeypatch, change, expected):
+    from xfuser.core.attention.spec import AttentionBackendType
+
+    settings = {"ulysses": 4, "ring": 1, "heads": 8, "backend": "AITER", "fp8_comms": None} | change
+    state = SimpleNamespace(
+        attention_backend=AttentionBackendType[settings["backend"]],
+        fp8_comms=settings["fp8_comms"],
+        _xdit_compile_capture_bypass_attention=change.get("capture_bypass", False),
+    )
+    monkeypatch.setattr(transformer_flux3, "get_runtime_state", lambda: state)
+    monkeypatch.setattr(transformer_flux3, "get_ulysses_parallel_world_size", lambda: settings["ulysses"])
+    monkeypatch.setattr(transformer_flux3, "get_ring_parallel_world_size", lambda: settings["ring"])
+    processor = transformer_flux3.xFuserFlux3AttnProcessor()
+    processor.local = change.get("local", False)
+    if change.get("disabled"):
+        processor.seq_major_ulysses = False
+
+    assert processor._uses_seq_major_ulysses(SimpleNamespace(heads=settings["heads"])) is expected

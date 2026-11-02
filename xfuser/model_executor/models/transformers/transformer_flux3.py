@@ -14,13 +14,16 @@ from diffusers.models.transformers.transformer_flux3 import (
     _get_qkv_projections,
 )
 
+from xfuser.core.attention.spec import AttentionBackendType
 from xfuser.core.distributed import (
+    get_ring_parallel_world_size,
     get_runtime_state,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
+    get_ulysses_parallel_world_size,
 )
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
-from xfuser.model_executor.layers.usp import USP, attention
+from xfuser.model_executor.layers.usp import USP, attention, ulysses_aiter_attention
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
     gather_and_unpad,
@@ -37,9 +40,25 @@ class xFuserFlux3AttnProcessor:
     every rank holds the whole stream, so attention runs without collectives.
     """
 
+    # Ulysses-only AITER attention takes the sequence-major exchange (see ulysses_aiter_attention).
+    seq_major_ulysses = True
+
     def __init__(self):
         self.valid_kv_len: Optional[int] = None
         self.local = False
+
+    def _uses_seq_major_ulysses(self, attn: Flux3Attention) -> bool:
+        if self.local or not self.seq_major_ulysses:
+            return False
+        ulysses_degree = get_ulysses_parallel_world_size()
+        if ulysses_degree <= 1 or get_ring_parallel_world_size() > 1 or attn.heads % ulysses_degree:
+            return False
+        state = get_runtime_state()
+        return (
+            state.attention_backend == AttentionBackendType.AITER
+            and state.fp8_comms is None
+            and not getattr(state, "_xdit_compile_capture_bypass_attention", False)
+        )
 
     def __call__(
         self,
@@ -74,6 +93,11 @@ class xFuserFlux3AttnProcessor:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
         query, key = query.to(value.dtype), key.to(value.dtype)
+
+        if self._uses_seq_major_ulysses(attn):
+            hidden_states = ulysses_aiter_attention(query, key, value, self.valid_kv_len)
+            hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+            return attn.to_out[1](attn.to_out[0](hidden_states))
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)

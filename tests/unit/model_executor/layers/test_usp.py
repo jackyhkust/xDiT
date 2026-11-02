@@ -97,6 +97,26 @@ def test_combined_gqa_qkv_all_to_all(all_to_all, world_size):
         torch.testing.assert_close(actual_tensor, expected_tensor)
 
 
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_seq_major_qkv_exchange_gives_each_rank_its_heads_over_the_whole_sequence(world_size, batch):
+    heads, shard_len, head_dim = 2 * world_size, 3, 4
+    # Rank p holds tokens [p * shard_len, (p + 1) * shard_len) of every head.
+    full = [torch.randn(batch, world_size * shard_len, heads, head_dim) for _ in range(3)]
+    sends = [
+        usp._seq_major_qkv_send(*(t[:, p * shard_len : (p + 1) * shard_len] for t in full), world_size)
+        for p in range(world_size)
+    ]
+
+    for rank in range(world_size):
+        received = torch.stack([send[rank] for send in sends])
+        views = usp._seq_major_qkv_views(received)
+        local_heads = slice(rank * heads // world_size, (rank + 1) * heads // world_size)
+        for view, tensor in zip(views, full):
+            assert view.untyped_storage().data_ptr() == received.untyped_storage().data_ptr()
+            torch.testing.assert_close(view, tensor[:, :, local_heads], rtol=0, atol=0)
+
+
 def test_repeat_kv_heads_preserves_gqa_order():
     key = torch.tensor([[[[0.0]], [[1.0]]]])
     value = key + 10
