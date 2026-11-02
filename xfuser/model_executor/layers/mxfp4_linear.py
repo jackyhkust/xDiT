@@ -28,6 +28,31 @@ def _(a: torch.Tensor, w_quant: torch.Tensor, w_scale: torch.Tensor, bias: Optio
     # Return fake tensor with correct shape
     return torch.empty(M, N, dtype=a.dtype, device=a.device)
 
+
+@torch.library.custom_op("xfuser::mxfp4_gemm_quantized", mutates_args=())
+def _mxfp4_gemm_quantized(
+    a_fp4: torch.Tensor,
+    a_scale: torch.Tensor,
+    w_quant: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``xfuser::mxfp4_gemm`` on an input already quantized as the HIP per-1x32 quantization
+    with shuffled scales does it; both given as uint8 (see ``mxfp4_fused_quant``)."""
+    return aiter.gemm_a4w4(
+        a_fp4.view(aiter.dtypes.fp4x2),
+        w_quant,
+        a_scale.view(aiter.dtypes.fp8_e8m0),
+        w_scale,
+        bpreshuffle=True,
+        bias=bias,
+    )
+
+
+@_mxfp4_gemm_quantized.register_fake
+def _(a_fp4, a_scale, w_quant, w_scale, bias=None):
+    return torch.empty(a_fp4.shape[0], w_quant.shape[0], dtype=torch.bfloat16, device=a_fp4.device)
+
 class xFuserMXFP4Linear(nn.Module):
     """
     Custom Linear layer using MXFP4 GEMM operation
@@ -287,6 +312,14 @@ class xFuserMXFP4Linear(nn.Module):
         output = output.view(*original_shape[:-1], self.out_features)
         
         return output
+
+    def forward_quantized(self, a_fp4: torch.Tensor, a_scale: torch.Tensor, leading_shape) -> torch.Tensor:
+        """``forward`` of the input whose quantization is ``a_fp4`` and ``a_scale`` (see
+        ``mxfp4_fused_quant``), reshaped to ``[*leading_shape, out_features]``."""
+        output = torch.ops.xfuser.mxfp4_gemm_quantized(a_fp4, a_scale, self.weight_shuffle, self.weight_scale, None)
+        if self.bias is not None:
+            output = output + self.bias
+        return output.view(*leading_shape, self.out_features)
     
     def extra_repr(self):
         """String representation (for print(model))"""
