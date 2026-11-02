@@ -141,6 +141,10 @@ class _Flux3Model(xFuserModel):
         )
         from xfuser.model_executor.pipelines.pipeline_flux3 import prepare_flux3_pipeline
 
+        if self.config.use_fp4_gemms:
+            from xfuser.model_executor.layers.aiter_tuned_configs import register_aiter_a4w4_tuned_gemms
+
+            register_aiter_a4w4_tuned_gemms("flux3_klein_a4w4_tuned_gemm.csv")
         log(f"Loading {self.settings.model_name}")
         transformer = self.loader.load_transformer(xFuserFlux3Transformer2DWrapper)
         pipe = prepare_flux3_pipeline(
