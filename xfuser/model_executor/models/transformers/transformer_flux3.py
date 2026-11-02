@@ -24,7 +24,7 @@ from xfuser.core.distributed import (
 )
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.model_executor.layers import usp_sdma
-from xfuser.model_executor.layers.usp import PROCESS_GROUP, USP, attention, ulysses_aiter_attention
+from xfuser.model_executor.layers.usp import PROCESS_GROUP, USP, attention, seq_major_attention_output, ulysses_aiter_attention
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
     gather_and_unpad,
@@ -88,9 +88,8 @@ class xFuserFlux3AttnProcessor:
         query, key, value = self._norm_rope(attn, query, key, value, image_rotary_emb)
 
         if self._uses_seq_major_ulysses(attn):
-            hidden_states = ulysses_aiter_attention(query, key, value, self.valid_kv_len)
-            hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-            return attn.to_out[1](attn.to_out[0](hidden_states))
+            received = ulysses_aiter_attention(query, key, value, self.valid_kv_len)
+            return attn.to_out[1](attn.to_out[0](seq_major_attention_output(received)))
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)

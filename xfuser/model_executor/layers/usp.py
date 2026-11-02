@@ -216,14 +216,29 @@ def _seq_major_qkv_views(received):
     return tuple(joined[:, :, index].transpose(0, 1) for index in range(3))
 
 
+def _seq_major_output_send(out):
+    """BSHD attention output ``[b, P*s, h/P, d]`` as a ``[P*s, b, h/P, d]`` send buffer:
+    chunk ``p`` holds rank ``p``'s tokens."""
+    return out.transpose(0, 1).contiguous()
+
+
+def seq_major_attention_output(received):
+    """The ``[b, s, P * h/P * d]`` rows of a received ``[P, s, b, h/P, d]`` attention output."""
+    world_size, s, b, heads, d = received.shape
+    return received.permute(2, 1, 0, 3, 4).reshape(b, s, world_size * heads * d)
+
+
 def ulysses_aiter_attention(query, key, value, valid_kv_len=None):
-    """Ulysses-only attention with AITER's dense kernel, from and to BSHD q, k, v.
+    """Ulysses-only attention with AITER's dense kernel on BSHD q, k, v.
 
     Same result as ``USP`` with the AITER backend and ``combine_qkv_a2a=True``, without the
-    BHSD round trip: q, k and v travel in one sequence-major exchange and reach the kernel
+    BHSD round trips: q, k and v travel in one sequence-major exchange and reach the kernel
     as strided BSHD views, which it reads directly, so no copy runs between the exchange and
-    the kernel. ``valid_kv_len`` drops a uniform trailing K/V pad. Returns BHSD
-    ``[b, h, s, d]`` for this rank's tokens, like ``USP``.
+    the kernel. ``valid_kv_len`` drops a uniform trailing K/V pad.
+
+    Returns the output exchange's receive buffer ``[P, s, b, h/P, d]``: chunk ``p`` holds
+    heads ``p * h/P`` onwards for this rank's ``s`` tokens. ``seq_major_attention_output``
+    gives its ``[b, s, h * d]`` rows with one copy; a consumer may read it in place instead.
     """
     world_size = get_ulysses_parallel_world_size()
     received = _sdpa_all_to_all_single(_seq_major_qkv_send(query, key, value, world_size))
@@ -233,7 +248,9 @@ def ulysses_aiter_attention(query, key, value, valid_kv_len=None):
             raise ValueError(f"valid_kv_len must be in [1, {key.shape[1]}], got {valid_kv_len}.")
         key, value = key[:, :valid_kv_len], value[:, :valid_kv_len]
     out, _ = torch.ops.xfuser.aiter_attn(query, key, value, 0.0, False)
-    return _ft_c_output_all_to_all(out.transpose(1, 2))
+    b, seq_len, heads, d = out.shape
+    received = _sdpa_all_to_all_single(_seq_major_output_send(out))
+    return received.view(world_size, seq_len // world_size, b, heads, d)
 
 
 def _combined_gqa_qkv_all_to_all(q, k, v, *extra):
