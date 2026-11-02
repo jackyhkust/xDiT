@@ -117,6 +117,27 @@ def test_seq_major_qkv_exchange_gives_each_rank_its_heads_over_the_whole_sequenc
             torch.testing.assert_close(view, tensor[:, :, local_heads], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_seq_major_output_exchange_gives_each_rank_its_tokens_with_every_head(world_size, batch):
+    heads, shard_len, head_dim = 2 * world_size, 3, 4
+    full = torch.randn(batch, world_size * shard_len, heads, head_dim)
+    local_heads = heads // world_size
+    # Rank p computed heads [p * local_heads, (p + 1) * local_heads) for the whole sequence.
+    sends = [
+        usp._seq_major_output_send(full[:, :, p * local_heads : (p + 1) * local_heads]).view(
+            world_size, shard_len, batch, local_heads, head_dim
+        )
+        for p in range(world_size)
+    ]
+
+    for rank in range(world_size):
+        received = torch.stack([send[rank] for send in sends])
+        rows = usp.seq_major_attention_output(received)
+        expected = full[:, rank * shard_len : (rank + 1) * shard_len].flatten(2)
+        torch.testing.assert_close(rows, expected, rtol=0, atol=0)
+
+
 def test_repeat_kv_heads_preserves_gqa_order():
     key = torch.tensor([[[[0.0]], [[1.0]]]])
     value = key + 10
