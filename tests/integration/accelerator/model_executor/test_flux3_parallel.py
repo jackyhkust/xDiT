@@ -25,7 +25,7 @@ EVEN_SHAPES = (16, (4, 8), ((2, 4), (2, 4)))
 LAYOUTS = {"padded": (TEXT_LEN, IMAGE_GRID, REFERENCE_GRIDS), "even": EVEN_SHAPES}
 
 
-def _tiny_model(device, flow_map=True):
+def _tiny_model(device, flow_map=True, head_dim=16):
     import torch
     from diffusers.models.transformers.transformer_flux3 import Flux3Transformer2DModel
 
@@ -36,11 +36,11 @@ def _tiny_model(device, flow_map=True):
             cond_in_channels=8,
             num_layers=2,
             num_single_layers=2,
-            attention_head_dim=16,
+            attention_head_dim=head_dim,
             num_attention_heads=NUM_HEADS,
             joint_attention_dim=32,
             timestep_channels=32,
-            axes_dims_rope=(4, 4, 4, 4),
+            axes_dims_rope=(head_dim // 4,) * 4,
             flow_map=flow_map,
         )
         .to(device)
@@ -86,7 +86,7 @@ def _inputs(device, layout, with_references):
     return {name: value.to(device) for name, value in inputs.items()}
 
 
-def _setup(rank, world_size, init_method, ulysses_degree, ring_degree=1, cfg_degree=1):
+def _setup(rank, world_size, init_method, ulysses_degree, ring_degree=1, cfg_degree=1, backend=BACKEND):
     import torch
 
     from xfuser.config.args import xFuserArgs
@@ -108,13 +108,13 @@ def _setup(rank, world_size, init_method, ulysses_degree, ring_degree=1, cfg_deg
         classifier_free_guidance_degree=cfg_degree, ulysses_degree=ulysses_degree, ring_degree=ring_degree
     )
     engine_config, _ = xFuserArgs(
-        attention_backend=BACKEND,
+        attention_backend=backend,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         use_cfg_parallel=cfg_degree > 1,
     ).create_config()
     initialize_runtime_state(engine_config=engine_config)
-    get_runtime_state().set_attention_backend(BACKEND)
+    get_runtime_state().set_attention_backend(backend)
     return torch.device(f"cuda:{rank}")
 
 
@@ -176,6 +176,51 @@ def test_sequence_parallel_matches_single_gpu_diffusers(accelerator_ranks, ulyss
         timeout=300,
         args=(ulysses_degree, ring_degree),
     )
+
+
+def _seq_major_worker(rank, world_size, init_method, ulysses_degree):
+    import torch
+
+    from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+    from xfuser.model_executor.models.transformers.transformer_flux3 import xFuserFlux3AttnProcessor
+
+    try:
+        device = _setup(rank, world_size, init_method, ulysses_degree, backend="AITER")
+        # AITER's dense kernel takes bf16 and a head dimension of at least 64.
+        wrapper = _wrapper_of(_tiny_model(device, head_dim=64), device).to(torch.bfloat16)
+        assert wrapper._joint_processor._uses_seq_major_ulysses(wrapper.single_transformer_blocks[0].attn)
+
+        for layout, with_references, replicate_text in itertools.product(LAYOUTS, (False, True), (True, False)):
+            inputs = _inputs(device, layout, with_references)
+            for name in ("hidden_states", "encoder_hidden_states", "image_cond_hidden_states"):
+                if name in inputs:
+                    inputs[name] = inputs[name].to(torch.bfloat16)
+            wrapper.replicate_text_max_tokens = 512 if replicate_text else 0
+            outputs = {}
+            for seq_major in (True, False):
+                xFuserFlux3AttnProcessor.seq_major_ulysses = seq_major
+                with torch.no_grad():
+                    outputs[seq_major] = wrapper(**inputs).sample
+            torch.testing.assert_close(
+                outputs[True],
+                outputs[False],
+                rtol=0,
+                atol=0,
+                msg=lambda m: (
+                    f"Ulysses {ulysses_degree}, {layout} layout, references={with_references}, "
+                    f"replicated text={replicate_text}: {m}"
+                ),
+            )
+    finally:
+        xFuserFlux3AttnProcessor.seq_major_ulysses = True
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+@pytest.mark.parametrize("ulysses_degree", [2, 4, 8])
+def test_seq_major_ulysses_exchange_matches_usp_with_aiter(accelerator_ranks, ulysses_degree):
+    pytest.importorskip("aiter")
+    accelerator_ranks(_seq_major_worker, world_size=ulysses_degree, timeout=300, args=(ulysses_degree,))
 
 
 def _cfg_worker(rank, world_size, init_method):

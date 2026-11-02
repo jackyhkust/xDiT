@@ -198,6 +198,44 @@ def _combined_qkv_all_to_all(q, k, v, *extra):
     return torch.unbind(qkv, dim=0)
 
 
+def _seq_major_qkv_send(q, k, v, world_size):
+    """BSHD q, k, v as one ``[P, s, b, 3, h/P, d]`` send buffer: destination rank, then
+    sequence position, so each received chunk is sequence-major."""
+    b, s, h, d = q.shape
+    qkv = torch.stack([q, k, v], dim=2).view(b, s, 3, world_size, h // world_size, d)
+    return qkv.permute(3, 1, 0, 2, 4, 5).contiguous()
+
+
+def _seq_major_qkv_views(received):
+    """The q, k, v BSHD views ``[b, P*s, h/P, d]`` of a received ``[P, s, b, 3, h/P, d]`` buffer.
+
+    Source rank and position merge into one sequence dimension of stride ``b * 3 * h/P * d``,
+    so nothing is copied; the views are strided, not contiguous.
+    """
+    joined = received.flatten(0, 1)
+    return tuple(joined[:, :, index].transpose(0, 1) for index in range(3))
+
+
+def ulysses_aiter_attention(query, key, value, valid_kv_len=None):
+    """Ulysses-only attention with AITER's dense kernel, from and to BSHD q, k, v.
+
+    Same result as ``USP`` with the AITER backend and ``combine_qkv_a2a=True``, without the
+    BHSD round trip: q, k and v travel in one sequence-major exchange and reach the kernel
+    as strided BSHD views, which it reads directly, so no copy runs between the exchange and
+    the kernel. ``valid_kv_len`` drops a uniform trailing K/V pad. Returns BHSD
+    ``[b, h, s, d]`` for this rank's tokens, like ``USP``.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    received = _sdpa_all_to_all_single(_seq_major_qkv_send(query, key, value, world_size))
+    query, key, value = _seq_major_qkv_views(received)
+    if valid_kv_len is not None:
+        if not 0 < valid_kv_len <= key.shape[1]:
+            raise ValueError(f"valid_kv_len must be in [1, {key.shape[1]}], got {valid_kv_len}.")
+        key, value = key[:, :valid_kv_len], value[:, :valid_kv_len]
+    out, _ = torch.ops.xfuser.aiter_attn(query, key, value, 0.0, False)
+    return _ft_c_output_all_to_all(out.transpose(1, 2))
+
+
 def _combined_gqa_qkv_all_to_all(q, k, v, *extra):
     """Exchange GQA Q/K/V in one collective without expanding KV heads.
 
