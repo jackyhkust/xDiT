@@ -173,6 +173,41 @@ class xFuserMXFP4Linear(nn.Module):
         fused.mm = fused._run_mxfp4_gemm
         return fused
 
+    @classmethod
+    def stacked_along_input(cls, layers) -> "xFuserMXFP4Linear":
+        """One layer computing ``sum(layer(x_i))`` from the inputs ``x_i`` concatenated along
+        the last dimension.
+
+        The 16x16 preshuffle keeps the 32-byte K chunks of each 16-row weight block in
+        order, and the scale shuffle the 8-group K chunks of each 32-row block, so for input
+        widths that are multiples of 256 the packed weights and scales of each row block
+        join along K without requantizing.
+        """
+        out_features = layers[0].out_features
+        if any(layer.out_features != out_features or layer.bias is not None for layer in layers):
+            raise ValueError("Only bias-free MXFP4 layers with the same output width can be stacked along K.")
+        if any(layer.in_features % 256 for layer in layers):
+            raise ValueError("MXFP4 layers stack along K only in multiples of 256 input features.")
+        if any(not hasattr(layer, "weight_shuffle") for layer in layers):
+            raise ValueError("Quantize the MXFP4 layers before stacking them.")
+        scale_rows = layers[0].weight_scale.shape[0]
+        if out_features % 16 or any(layer.weight_scale.shape[0] != scale_rows for layer in layers):
+            raise ValueError("The stacked MXFP4 layers must share their weight and scale row blocks.")
+        weight = torch.cat([layer.weight_shuffle.view(out_features // 16, -1) for layer in layers], dim=1)
+        scale = torch.cat([layer.weight_scale.view(scale_rows // 32, -1) for layer in layers], dim=1)
+        fused = cls.__new__(cls)
+        nn.Module.__init__(fused)
+        fused.in_features = sum(layer.in_features for layer in layers)
+        fused.out_features = out_features
+        fused.register_parameter("weight", None)
+        fused.register_parameter("bias", None)
+        fused.register_parameter(
+            "weight_shuffle", nn.Parameter(weight.view(out_features, -1), requires_grad=False)
+        )
+        fused.register_buffer("weight_scale", scale.view(scale_rows, -1), persistent=True)
+        fused.mm = fused._run_mxfp4_gemm
+        return fused
+
     def _is_fsdp_managed_parameter(self, parameter) -> bool:
         """Whether replacing ``parameter`` would break composable FSDP ownership."""
         try:

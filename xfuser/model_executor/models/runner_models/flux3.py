@@ -173,10 +173,15 @@ class _Flux3Model(xFuserModel):
         # compile. FSDP shards the separate weights, so sharded runs keep them.
         if self.config.fully_shard_degree > 1:
             return
-        from xfuser.model_executor.models.transformers.transformer_flux3 import fuse_block_input_projections
+        from xfuser.model_executor.models.transformers.transformer_flux3 import (
+            fuse_block_input_projections,
+            fuse_block_output_projections,
+        )
 
         fused = fuse_block_input_projections(self.pipe.transformer)
         log(f"FLUX.3: one input GEMM for q, k, v and the feed-forward in {fused} blocks")
+        fused = fuse_block_output_projections(self.pipe.transformer)
+        log(f"FLUX.3: one output GEMM for the attention and the feed-forward in {fused} blocks")
 
     def _expose_transformer_signature(self) -> None:
         """Show the denoise step the transformer's real forward parameters.

@@ -77,27 +77,31 @@ def _segments(lengths, dtype, generator):
     return segments
 
 
-def _reference(segments, attn, ff):
+def _reference(segments, branches):
     hidden, normed, offset = [], [], 0
     for x, gate, shift, scale in segments:
         rows = slice(offset, offset + x.shape[1])
-        h = (x.float() + gate.float() * (attn[:, rows].float() + ff[:, rows].float())).to(x.dtype)
+        branch = sum(output[:, rows].float() for output in branches)
+        h = (x.float() + gate.float() * branch).to(x.dtype)
         hidden.append(h)
         normed.append((1 + scale.float()) * F.layer_norm(h.float(), (DIM,), eps=EPS) + shift.float())
         offset += x.shape[1]
     return torch.cat(hidden, dim=1), torch.cat(normed, dim=1)
 
 
+@pytest.mark.parametrize("branch_count", [1, 2])  # a merged output GEMM, or attention and feed-forward
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("lengths", [(522,), (10, 512), (0, 66)])
-def test_gated_residual_layernorm_modulate_matches_upstream(lengths, dtype):
+def test_gated_residual_layernorm_modulate_matches_upstream(lengths, dtype, branch_count):
     generator = torch.Generator(device="cuda").manual_seed(0)
     segments = _segments(lengths, dtype, generator)
-    attn, ff = (torch.randn(2, sum(lengths), DIM, generator=generator, device="cuda").to(dtype) for _ in range(2))
-    ref_hidden, ref_normed = _reference(segments, attn, ff)
+    branches = [
+        torch.randn(2, sum(lengths), DIM, generator=generator, device="cuda").to(dtype) for _ in range(branch_count)
+    ]
+    ref_hidden, ref_normed = _reference(segments, branches)
 
     xs, gates, shifts, scales = (list(column) for column in zip(*segments))
-    hidden, normed = torch.ops.xfuser.gated_residual_layernorm_modulate(xs, gates, shifts, scales, attn, ff, EPS)
+    hidden, normed = torch.ops.xfuser.gated_residual_layernorm_modulate(xs, gates, shifts, scales, branches, EPS)
 
     if dtype == torch.bfloat16:
         torch.testing.assert_close(hidden, ref_hidden, rtol=0, atol=0)
@@ -106,8 +110,9 @@ def test_gated_residual_layernorm_modulate_matches_upstream(lengths, dtype):
     _assert_rounds_like(normed, ref_normed.to(dtype))
 
 
+@pytest.mark.parametrize("branch_count", [1, 2])
 @pytest.mark.parametrize("lengths", [(522,), (10, 2048)])
-def test_gated_residual_quant_matches_hip_quant_of_the_reference(lengths):
+def test_gated_residual_quant_matches_hip_quant_of_the_reference(lengths, branch_count):
     aiter = pytest.importorskip("aiter")
     from xfuser.model_executor.layers import mxfp4_fused_quant
 
@@ -115,15 +120,17 @@ def test_gated_residual_quant_matches_hip_quant_of_the_reference(lengths):
         pytest.skip("AITER's Triton MXFP4 helpers are unavailable.")
     generator = torch.Generator(device="cuda").manual_seed(0)
     segments = _segments(lengths, torch.bfloat16, generator)
-    attn, ff = (torch.randn(2, sum(lengths), DIM, generator=generator, device="cuda").bfloat16() for _ in range(2))
-    ref_hidden, ref_normed = _reference(segments, attn, ff)
+    branches = [
+        torch.randn(2, sum(lengths), DIM, generator=generator, device="cuda").bfloat16() for _ in range(branch_count)
+    ]
+    ref_hidden, ref_normed = _reference(segments, branches)
     ref_fp4, ref_scale = aiter.get_hip_quant(aiter.QuantType.per_1x32)(
         ref_normed.to(torch.bfloat16).flatten(0, 1).contiguous(), shuffle=True
     )
 
     xs, gates, shifts, scales = (list(column) for column in zip(*segments))
     hidden, fp4, scale = torch.ops.xfuser.gated_residual_layernorm_modulate_mxfp4_quant(
-        xs, gates, shifts, scales, attn, ff, EPS
+        xs, gates, shifts, scales, branches, EPS
     )
 
     torch.testing.assert_close(hidden, ref_hidden, rtol=0, atol=0)
