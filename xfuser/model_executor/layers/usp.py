@@ -226,8 +226,15 @@ def ulysses_aiter_attention(query, key, value, valid_kv_len=None):
     heads ``p * h/P`` onwards for this rank's ``s`` tokens. ``seq_major_attention_output``
     gives its ``[b, s, h * d]`` rows with one copy; a consumer may read it in place instead.
     """
+    send = _seq_major_qkv_send(query, key, value, get_ulysses_parallel_world_size())
+    return ulysses_aiter_attention_from_send(send, valid_kv_len)
+
+
+def ulysses_aiter_attention_from_send(send, valid_kv_len=None):
+    """``ulysses_aiter_attention`` from q, k, v already laid out as the ``[P, s, b, 3, h/P, d]``
+    send buffer, e.g. by the kernel that produced them."""
     world_size = get_ulysses_parallel_world_size()
-    received = _sdpa_all_to_all_single(_seq_major_qkv_send(query, key, value, world_size))
+    received = _sdpa_all_to_all_single(send)
     query, key, value = _seq_major_qkv_views(received)
     if valid_kv_len is not None:
         if not 0 < valid_kv_len <= key.shape[1]:

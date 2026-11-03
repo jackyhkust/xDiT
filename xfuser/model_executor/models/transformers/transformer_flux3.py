@@ -23,9 +23,15 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_world_size,
 )
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
-from xfuser.model_executor.layers import mxfp4_fused_quant
+from xfuser.model_executor.layers import fused_block_ops, mxfp4_fused_quant
 from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear
-from xfuser.model_executor.layers.usp import USP, attention, seq_major_attention_output, ulysses_aiter_attention
+from xfuser.model_executor.layers.usp import (
+    USP,
+    attention,
+    seq_major_attention_output,
+    ulysses_aiter_attention,
+    ulysses_aiter_attention_from_send,
+)
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
     gather_and_unpad,
@@ -36,8 +42,39 @@ from xfuser.model_executor.models.transformers.transformers_utils import (
 FUSED_MXFP4_QUANT = True
 
 
+# q/k RMSNorm and RoPE run in one kernel that also packs the Ulysses send buffer, and each
+# block's gated residual runs in the next block's LayerNorm kernel (see fused_block_ops).
+FUSED_QK_NORM_ROPE = True
+FUSED_BLOCK_RESIDUAL = True
+
+
 def _takes_quantized_input(layer: torch.nn.Module) -> bool:
     return FUSED_MXFP4_QUANT and mxfp4_fused_quant.MXFP4_FUSED_QUANT_AVAILABLE and type(layer) is xFuserMXFP4Linear
+
+
+def _fused_qk_norm_rope_args(attn: Flux3Attention, query, key, value, image_rotary_emb):
+    """The q/k weights, eps, cos and sin of ``fused_block_ops``' q/k kernel, or None when it
+    cannot stand in for upstream's norms and RoPE on these inputs."""
+    if not (FUSED_QK_NORM_ROPE and fused_block_ops.FUSED_BLOCK_OPS_AVAILABLE and query.is_cuda):
+        return None
+    if image_rotary_emb is None:
+        return None
+    norms = (attn.norm_q, attn.norm_k)
+    if any(type(norm) is not torch.nn.RMSNorm or norm.weight is None for norm in norms):
+        return None
+    if attn.norm_q.eps != attn.norm_k.eps:
+        return None
+    head_dim = attn.head_dim
+    if head_dim & (head_dim - 1) or head_dim < 16 or query.shape[-1] != attn.heads * head_dim:
+        return None
+    if query.stride(-1) != 1 or key.stride() != query.stride() or value.stride() != query.stride():
+        return None
+    cos, sin = image_rotary_emb
+    if cos.shape != (query.shape[1], head_dim) or cos.stride(-1) != 1 or sin.stride() != cos.stride():
+        return None
+    # The norms see fp32 q and k, so a default eps is fp32's.
+    eps = attn.norm_q.eps if attn.norm_q.eps is not None else torch.finfo(torch.float32).eps
+    return attn.norm_q.weight, attn.norm_k.weight, eps, cos, sin
 
 
 class xFuserFlux3AttnProcessor:
@@ -90,22 +127,35 @@ class xFuserFlux3AttnProcessor:
         value: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Attention and output projection from already projected q, k and v."""
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
+        """Attention and output projection from already projected ``[b, s, h * d]`` q, k and v."""
+        fused_args = _fused_qk_norm_rope_args(attn, query, key, value, image_rotary_emb)
+        seq_major = self._uses_seq_major_ulysses(attn)
+        if fused_args is not None and seq_major:
+            send = torch.ops.xfuser.qk_norm_rope_seq_major_send(
+                query, key, value, *fused_args, attn.heads, get_ulysses_parallel_world_size()
+            )
+        elif fused_args is not None:
+            query, key = torch.ops.xfuser.qk_norm_rope(query, key, *fused_args, attn.heads).unbind(2)
+            value = value.unflatten(-1, (attn.heads, -1))
+        else:
+            query = query.unflatten(-1, (attn.heads, -1))
+            key = key.unflatten(-1, (attn.heads, -1))
+            value = value.unflatten(-1, (attn.heads, -1))
 
-        # QK norm and RoPE in fp32 with one cast back, as upstream.
-        query = attn.norm_q(query.float())
-        key = attn.norm_k(key.float())
+            # QK norm and RoPE in fp32 with one cast back, as upstream.
+            query = attn.norm_q(query.float())
+            key = attn.norm_k(key.float())
 
-        if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
-        query, key = query.to(value.dtype), key.to(value.dtype)
+            if image_rotary_emb is not None:
+                query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            query, key = query.to(value.dtype), key.to(value.dtype)
 
-        if self._uses_seq_major_ulysses(attn):
-            received = ulysses_aiter_attention(query, key, value, self.valid_kv_len)
+        if seq_major:
+            if fused_args is not None:
+                received = ulysses_aiter_attention_from_send(send, self.valid_kv_len)
+            else:
+                received = ulysses_aiter_attention(query, key, value, self.valid_kv_len)
             if _takes_quantized_input(attn.to_out[0]):
                 _, seq_len, batch, _, _ = received.shape
                 quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(received)
@@ -170,28 +220,98 @@ def _modulated_input_projection(block, segments):
     return block.fused_in(normed[0] if len(normed) == 1 else torch.cat(normed, dim=1))
 
 
+def _fuses_block_residual(block: torch.nn.Module) -> bool:
+    """Whether ``block`` (compiled or not) can take the previous block's branch outputs and
+    apply its gated residual in the kernel computing its own input."""
+    block = getattr(block, "_orig_mod", block)
+    return (
+        FUSED_BLOCK_RESIDUAL
+        and fused_block_ops.FUSED_BLOCK_OPS_AVAILABLE
+        and isinstance(block, (_FusedFlux3ModeTransformerBlock, _FusedFlux3SingleTransformerBlock))
+    )
+
+
+def _deferred_residuals(blocks, hidden_states: torch.Tensor) -> list:
+    """For each block of a stage, whether it leaves its gated residual to the next block."""
+    takes = [hidden_states.is_cuda and _fuses_block_residual(block) for block in blocks]
+    return [takes[index] and index + 1 < len(blocks) and takes[index + 1] for index in range(len(blocks))]
+
+
+def _residual_kwargs(branch_outputs, defer: bool) -> dict:
+    """A block call's residual hand-over arguments; none for a block that takes no part."""
+    kwargs = {} if branch_outputs is None else {"branch_outputs": branch_outputs}
+    if defer:
+        kwargs["defer_residual"] = True
+    return kwargs
+
+
+def _block_input(block, segments, branch_outputs):
+    """The hidden state of each ``(x, shift, scale, gate)`` segment and ``block.fused_in`` of
+    their concatenated modulated norms. With ``branch_outputs``, the previous block's
+    ``(attn_output, ff_output)`` over the concatenated segments, each ``x`` first takes that
+    block's gated residual ``x + gate * (attn_output + ff_output)``, in the same kernel."""
+    if branch_outputs is None:
+        hidden = [x for x, _, _, _ in segments]
+        return hidden, _modulated_input_projection(block, [(x, shift, scale) for x, shift, scale, _ in segments])
+    xs, shifts, scales, gates = (list(column) for column in zip(*segments))
+    args = (xs, gates, shifts, scales, *branch_outputs, block.norm.eps)
+    if _takes_quantized_input(block.fused_in):
+        hidden, *quantized = torch.ops.xfuser.gated_residual_layernorm_modulate_mxfp4_quant(*args)
+        projected = block.fused_in.forward_quantized(*quantized, hidden.shape[:2])
+    else:
+        hidden, normed = torch.ops.xfuser.gated_residual_layernorm_modulate(*args)
+        projected = block.fused_in(normed)
+    return list(hidden.split([x.shape[1] for x in xs], dim=1)), projected
+
+
 class _FusedFlux3ModeTransformerBlock(Flux3ModeTransformerBlock):
     """Flux3ModeTransformerBlock with q, k, v and the feed-forward input in one GEMM."""
 
-    def forward(self, hidden_states, temb_mod, image_rotary_emb):
+    def forward(self, hidden_states, temb_mod, image_rotary_emb, branch_outputs=None, defer_residual=False):
+        """Upstream's block. ``branch_outputs`` is the previous block's ``(attn_output,
+        ff_output)`` under the same ``temb_mod``: ``hidden_states`` still owes that block's
+        gated residual. ``defer_residual`` returns ``(hidden_states, attn_output, ff_output)``,
+        leaving this block's residual to the next block likewise."""
         mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
-        projected = _modulated_input_projection(self, [(hidden_states, mod_shift, mod_scale)])
+        (hidden_states,), projected = _block_input(
+            self, [(hidden_states, mod_shift, mod_scale, mod_gate)], branch_outputs
+        )
         attn_output, ff_output = _fused_attention_and_ff(self, projected, image_rotary_emb)
+        if defer_residual:
+            return hidden_states, attn_output, ff_output
         return hidden_states + mod_gate * (attn_output + ff_output)
 
 
 class _FusedFlux3SingleTransformerBlock(Flux3SingleTransformerBlock):
     """Flux3SingleTransformerBlock with q, k, v and the feed-forward input in one GEMM."""
 
-    def forward(self, hidden_states, encoder_hidden_states, temb_mod, temb_mod_context, image_rotary_emb):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        temb_mod,
+        temb_mod_context,
+        image_rotary_emb,
+        branch_outputs=None,
+        defer_residual=False,
+    ):
+        """Upstream's block, with ``branch_outputs`` and ``defer_residual`` as in
+        ``_FusedFlux3ModeTransformerBlock``; deferring returns ``(encoder_hidden_states,
+        hidden_states, attn_output, ff_output)``."""
         mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
         c_mod_shift, c_mod_scale, c_mod_gate = torch.chunk(temb_mod_context, 3, dim=-1)
 
-        projected = _modulated_input_projection(
+        (encoder_hidden_states, hidden_states), projected = _block_input(
             self,
-            [(encoder_hidden_states, c_mod_shift, c_mod_scale), (hidden_states, mod_shift, mod_scale)],
+            [
+                (encoder_hidden_states, c_mod_shift, c_mod_scale, c_mod_gate),
+                (hidden_states, mod_shift, mod_scale, mod_gate),
+            ],
+            branch_outputs,
         )
         attn_output, ff_output = _fused_attention_and_ff(self, projected, image_rotary_emb)
+        if defer_residual:
+            return encoder_hidden_states, hidden_states, attn_output, ff_output
         output = attn_output + ff_output
 
         context_output, content_output = torch.split(
@@ -392,8 +512,11 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
 
         temb_mod = self._modulation(f"{name}.mod", mod_row, hidden_states.shape[1])
         rotary_emb = self._rotary(name, rotary_emb)
-        for block in blocks:
-            hidden_states = block(hidden_states, temb_mod, rotary_emb)
+        branch_outputs = None
+        for block, defer in zip(blocks, _deferred_residuals(blocks, hidden_states)):
+            outputs = block(hidden_states, temb_mod, rotary_emb, **_residual_kwargs(branch_outputs, defer))
+            hidden_states, *branch_outputs = outputs if defer else (outputs,)
+            branch_outputs = tuple(branch_outputs) or None
         return hidden_states if local else gather_and_unpad(hidden_states, pad, dim=1)
 
     def forward(
@@ -512,14 +635,18 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
             length=chunk_len - local_txt_len,
         )
 
-        for block in self.single_transformer_blocks:
-            context_states, content_states = block(
+        blocks = self.single_transformer_blocks
+        branch_outputs = None
+        for block, defer in zip(blocks, _deferred_residuals(blocks, content_states)):
+            context_states, content_states, *branch_outputs = block(
                 hidden_states=content_states,
                 encoder_hidden_states=context_states,
                 temb_mod=content_mod,
                 temb_mod_context=context_mod,
                 image_rotary_emb=joint_rotary_emb,
+                **_residual_kwargs(branch_outputs, defer),
             )
+            branch_outputs = tuple(branch_outputs) or None
 
         # 7. Output layers on this rank's image tokens, which follow its text tokens. They
         #    are per token, so only the output channels need gathering. Every image token
