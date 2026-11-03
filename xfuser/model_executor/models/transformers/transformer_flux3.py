@@ -128,6 +128,28 @@ class xFuserFlux3AttnProcessor:
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Attention and output projection from already projected ``[b, s, h * d]`` q, k and v."""
+        attention_output = self.attend_unprojected(attn, query, key, value, image_rotary_emb)
+        if attention_output.ndim == 5:
+            if _takes_quantized_input(attn.to_out[0]):
+                _, seq_len, batch, _, _ = attention_output.shape
+                quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(attention_output)
+                hidden_states = attn.to_out[0].forward_quantized(*quantized, (batch, seq_len))
+            else:
+                hidden_states = attn.to_out[0](seq_major_attention_output(attention_output))
+        else:
+            hidden_states = attn.to_out[0](attention_output)
+        return attn.to_out[1](hidden_states)
+
+    def attend_unprojected(
+        self,
+        attn: Flux3Attention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """``attend`` before the output projection: the ``[P, s, b, h/P, d]`` receive buffer
+        of the sequence-major exchange, or else ``[b, s, h * d]`` rows."""
         fused_args = _fused_qk_norm_rope_args(attn, query, key, value, image_rotary_emb)
         seq_major = self._uses_seq_major_ulysses(attn)
         if fused_args is not None and seq_major:
@@ -153,16 +175,8 @@ class xFuserFlux3AttnProcessor:
 
         if seq_major:
             if fused_args is not None:
-                received = ulysses_aiter_attention_from_send(send, self.valid_kv_len)
-            else:
-                received = ulysses_aiter_attention(query, key, value, self.valid_kv_len)
-            if _takes_quantized_input(attn.to_out[0]):
-                _, seq_len, batch, _, _ = received.shape
-                quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(received)
-                hidden_states = attn.to_out[0].forward_quantized(*quantized, (batch, seq_len))
-            else:
-                hidden_states = attn.to_out[0](seq_major_attention_output(received))
-            return attn.to_out[1](hidden_states)
+                return ulysses_aiter_attention_from_send(send, self.valid_kv_len)
+            return ulysses_aiter_attention(query, key, value, self.valid_kv_len)
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
@@ -177,11 +191,7 @@ class xFuserFlux3AttnProcessor:
             )
 
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
-
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
-        return hidden_states
+        return hidden_states.to(query.dtype)
 
 
 def flux3_attn_modules(transformer) -> list[torch.nn.Module]:
@@ -195,16 +205,34 @@ def flux3_attn_modules(transformer) -> list[torch.nn.Module]:
     return [block.attn for block in blocks]
 
 
-def _fused_attention_and_ff(block, projected, image_rotary_emb):
-    """The block's attention and feed-forward outputs from its shared input GEMM's output."""
+def _block_branches(block, projected, image_rotary_emb) -> tuple:
+    """The block's branch outputs from its shared input GEMM's output, whose sum the gated
+    residual adds: ``(attn_output, ff_output)``, or the one output of ``block.fused_out``."""
     query, key, value, ff_hidden = projected.split(block.fused_in_split, dim=-1)
-    attn_output = block.attn.processor.attend(block.attn, query, key, value, image_rotary_emb)
-    if _takes_quantized_input(block.ff.linear_out):
-        quantized = torch.ops.xfuser.swiglu_mxfp4_quant(ff_hidden)
-        ff_output = block.ff.linear_out.forward_quantized(*quantized, ff_hidden.shape[:-1])
-    else:
-        ff_output = block.ff.linear_out(block.ff.act_fn(ff_hidden))
-    return attn_output, ff_output
+    processor = block.attn.processor
+    if not hasattr(block, "fused_out"):
+        attn_output = processor.attend(block.attn, query, key, value, image_rotary_emb)
+        if _takes_quantized_input(block.ff.linear_out):
+            quantized = torch.ops.xfuser.swiglu_mxfp4_quant(ff_hidden)
+            ff_output = block.ff.linear_out.forward_quantized(*quantized, ff_hidden.shape[:-1])
+        else:
+            ff_output = block.ff.linear_out(block.ff.act_fn(ff_hidden))
+        return attn_output, ff_output
+
+    attention_output = processor.attend_unprojected(block.attn, query, key, value, image_rotary_emb)
+    if _takes_quantized_input(block.fused_out):
+        if attention_output.ndim == 3:
+            # [b, s, h * d] rows as a one-rank receive buffer [1, s, b, h, d].
+            attention_output = attention_output.unflatten(-1, (block.attn.heads, -1)).unsqueeze(0).transpose(1, 2)
+        quantized = torch.ops.xfuser.attention_output_swiglu_mxfp4_quant(attention_output, ff_hidden)
+        return (block.fused_out.forward_quantized(*quantized, ff_hidden.shape[:-1]),)
+    if attention_output.ndim == 5:
+        attention_output = seq_major_attention_output(attention_output)
+    return (block.fused_out(torch.cat([attention_output, block.ff.act_fn(ff_hidden)], dim=-1)),)
+
+
+def _branch_sum(branches: tuple) -> torch.Tensor:
+    return branches[0] if len(branches) == 1 else branches[0] + branches[1]
 
 
 def _modulated_input_projection(block, segments):
@@ -247,14 +275,14 @@ def _residual_kwargs(branch_outputs, defer: bool) -> dict:
 
 def _block_input(block, segments, branch_outputs):
     """The hidden state of each ``(x, shift, scale, gate)`` segment and ``block.fused_in`` of
-    their concatenated modulated norms. With ``branch_outputs``, the previous block's
-    ``(attn_output, ff_output)`` over the concatenated segments, each ``x`` first takes that
-    block's gated residual ``x + gate * (attn_output + ff_output)``, in the same kernel."""
+    their concatenated modulated norms. With ``branch_outputs``, the previous block's branch
+    outputs over the concatenated segments (see ``_block_branches``), each ``x`` first takes
+    that block's gated residual ``x + gate * sum(branch_outputs)``, in the same kernel."""
     if branch_outputs is None:
         hidden = [x for x, _, _, _ in segments]
         return hidden, _modulated_input_projection(block, [(x, shift, scale) for x, shift, scale, _ in segments])
     xs, shifts, scales, gates = (list(column) for column in zip(*segments))
-    args = (xs, gates, shifts, scales, *branch_outputs, block.norm.eps)
+    args = (xs, gates, shifts, scales, list(branch_outputs), block.norm.eps)
     if _takes_quantized_input(block.fused_in):
         hidden, *quantized = torch.ops.xfuser.gated_residual_layernorm_modulate_mxfp4_quant(*args)
         projected = block.fused_in.forward_quantized(*quantized, hidden.shape[:2])
@@ -265,25 +293,27 @@ def _block_input(block, segments, branch_outputs):
 
 
 class _FusedFlux3ModeTransformerBlock(Flux3ModeTransformerBlock):
-    """Flux3ModeTransformerBlock with q, k, v and the feed-forward input in one GEMM."""
+    """Flux3ModeTransformerBlock with q, k, v and the feed-forward input in one GEMM, and
+    optionally the attention and feed-forward outputs in another (``fused_out``)."""
 
     def forward(self, hidden_states, temb_mod, image_rotary_emb, branch_outputs=None, defer_residual=False):
-        """Upstream's block. ``branch_outputs`` is the previous block's ``(attn_output,
-        ff_output)`` under the same ``temb_mod``: ``hidden_states`` still owes that block's
-        gated residual. ``defer_residual`` returns ``(hidden_states, attn_output, ff_output)``,
+        """Upstream's block. ``branch_outputs`` is the previous block's branch outputs (see
+        ``_block_branches``) under the same ``temb_mod``: ``hidden_states`` still owes that
+        block's gated residual. ``defer_residual`` returns ``(hidden_states, *branch_outputs)``,
         leaving this block's residual to the next block likewise."""
         mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
         (hidden_states,), projected = _block_input(
             self, [(hidden_states, mod_shift, mod_scale, mod_gate)], branch_outputs
         )
-        attn_output, ff_output = _fused_attention_and_ff(self, projected, image_rotary_emb)
+        branches = _block_branches(self, projected, image_rotary_emb)
         if defer_residual:
-            return hidden_states, attn_output, ff_output
-        return hidden_states + mod_gate * (attn_output + ff_output)
+            return hidden_states, *branches
+        return hidden_states + mod_gate * _branch_sum(branches)
 
 
 class _FusedFlux3SingleTransformerBlock(Flux3SingleTransformerBlock):
-    """Flux3SingleTransformerBlock with q, k, v and the feed-forward input in one GEMM."""
+    """Flux3SingleTransformerBlock with q, k, v and the feed-forward input in one GEMM, and
+    optionally the attention and feed-forward outputs in another (``fused_out``)."""
 
     def forward(
         self,
@@ -297,7 +327,7 @@ class _FusedFlux3SingleTransformerBlock(Flux3SingleTransformerBlock):
     ):
         """Upstream's block, with ``branch_outputs`` and ``defer_residual`` as in
         ``_FusedFlux3ModeTransformerBlock``; deferring returns ``(encoder_hidden_states,
-        hidden_states, attn_output, ff_output)``."""
+        hidden_states, *branch_outputs)``."""
         mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
         c_mod_shift, c_mod_scale, c_mod_gate = torch.chunk(temb_mod_context, 3, dim=-1)
 
@@ -309,10 +339,10 @@ class _FusedFlux3SingleTransformerBlock(Flux3SingleTransformerBlock):
             ],
             branch_outputs,
         )
-        attn_output, ff_output = _fused_attention_and_ff(self, projected, image_rotary_emb)
+        branches = _block_branches(self, projected, image_rotary_emb)
         if defer_residual:
-            return encoder_hidden_states, hidden_states, attn_output, ff_output
-        output = attn_output + ff_output
+            return encoder_hidden_states, hidden_states, *branches
+        output = _branch_sum(branches)
 
         context_output, content_output = torch.split(
             output, [encoder_hidden_states.shape[1], hidden_states.shape[1]], dim=1
@@ -349,6 +379,15 @@ def _concatenated_linear(layers) -> Optional[torch.nn.Module]:
     return fused
 
 
+def _flux3_blocks(transformer):
+    return (
+        *transformer.txt_mode_blocks,
+        *transformer.mode_blocks["image"],
+        *transformer.mode_blocks["image_cond"],
+        *transformer.single_transformer_blocks,
+    )
+
+
 def fuse_block_input_projections(transformer) -> int:
     """Give every block whose q, k, v and feed-forward input layers can be stacked one
     GEMM for all four, and return how many blocks changed.
@@ -357,12 +396,7 @@ def fuse_block_input_projections(transformer) -> int:
     instead of four times under MXFP4.
     """
     fused_blocks = 0
-    for block in (
-        *transformer.txt_mode_blocks,
-        *transformer.mode_blocks["image"],
-        *transformer.mode_blocks["image_cond"],
-        *transformer.single_transformer_blocks,
-    ):
+    for block in _flux3_blocks(transformer):
         fused_class = _FUSED_BLOCK_CLASSES.get(type(block))
         if fused_class is None:
             continue
@@ -374,6 +408,51 @@ def fuse_block_input_projections(transformer) -> int:
         block.fused_in_split = [layer.out_features for layer in layers]
         del block.attn.to_q, block.attn.to_k, block.attn.to_v, block.ff.linear_in
         block.__class__ = fused_class
+        fused_blocks += 1
+    return fused_blocks
+
+
+def _input_stacked_linear(layers) -> Optional[torch.nn.Module]:
+    """One layer equal to the sum of the given layers' outputs, taking their inputs
+    concatenated, or None if their kind cannot be stacked (as ``_concatenated_linear``)."""
+    if all(type(layer) is xFuserMXFP4Linear for layer in layers):
+        try:
+            return xFuserMXFP4Linear.stacked_along_input(layers)
+        except ValueError:
+            return None
+    plain = all(
+        type(layer) is torch.nn.Linear and layer.bias is None and type(layer.weight.data) is torch.Tensor
+        for layer in layers
+    )
+    if not plain:
+        return None
+    fused = torch.nn.Linear(
+        sum(layer.in_features for layer in layers),
+        layers[0].out_features,
+        bias=False,
+        device="meta",
+    )
+    fused.weight = torch.nn.Parameter(torch.cat([layer.weight.data for layer in layers], dim=1), requires_grad=False)
+    return fused
+
+
+def fuse_block_output_projections(transformer) -> int:
+    """Give every block with one input GEMM (see ``fuse_block_input_projections``) whose
+    attention and feed-forward output layers can be stacked one GEMM for both, on the
+    attention output and the feed-forward hidden state side by side, and return how many
+    blocks changed. The GEMM also adds the two outputs, which the residual then takes.
+    """
+    fused_blocks = 0
+    for block in _flux3_blocks(transformer):
+        if not isinstance(block, tuple(_FUSED_BLOCK_CLASSES.values())) or hasattr(block, "fused_out"):
+            continue
+        if not isinstance(block.attn.to_out[1], torch.nn.Dropout) or block.attn.to_out[1].p:
+            continue
+        fused = _input_stacked_linear((block.attn.to_out[0], block.ff.linear_out))
+        if fused is None:
+            continue
+        block.fused_out = fused
+        del block.attn.to_out, block.ff.linear_out
         fused_blocks += 1
     return fused_blocks
 

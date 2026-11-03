@@ -9,6 +9,8 @@ quantization (``aiter.get_hip_quant(per_1x32)(y, shuffle=True)``, the one inside
 - ``swiglu_mxfp4_quant``: ``silu(x[..., :n]) * x[..., n:]``, the feed-forward hidden state.
 - ``seq_major_attention_output_mxfp4_quant``: the ``[b * s, h * d]`` rows of a Ulysses output
   all-to-all receive buffer ``[P, s, b, h / P, d]``, without the reorder copy.
+- ``attention_output_swiglu_mxfp4_quant``: those attention rows and the feed-forward hidden
+  state side by side, the input of a block's merged output GEMM.
 
 Both outputs are uint8: the values are ``[M, K / 2]`` and the scales are
 ``[ceil(M / 256) * 256, ceil(K / 256) * 8]`` in the order of ``_mx_scale_index``. The
@@ -65,6 +67,14 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
         onwards of ``row``, by the HIP rule: the dequantization scale is
         ``ceil_pow2(max(amax, 1e-10) * fp32(1 / 6))`` and the values round to E2M1 after a
         multiply by its exact reciprocal. Columns at or past ``cols`` must hold zero."""
+        _store_mxfp4_row_part(y, row, first_col, cols, 0, cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
+
+    @triton.jit
+    def _store_mxfp4_row_part(
+        y, row, first_col, cols, col_offset, row_cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K: tl.constexpr
+    ):
+        """``_store_mxfp4_row`` into columns ``col_offset`` to ``col_offset + cols`` of rows of
+        ``row_cols`` columns; ``col_offset`` is a multiple of the 32-column group."""
         GROUPS: tl.constexpr = BLOCK_K // 32
         groups = tl.reshape(y, [1, GROUPS, 32])
         amax = tl.maximum(tl.max(tl.abs(groups), axis=2), 1e-10)
@@ -76,13 +86,13 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
 
         half_cols = first_col // 2 + tl.arange(0, BLOCK_K // 2)
         tl.store(
-            fp4_ptr + row.to(tl.int64) * (cols // 2) + half_cols[None, :],
+            fp4_ptr + row.to(tl.int64) * (row_cols // 2) + col_offset // 2 + half_cols[None, :],
             packed,
             mask=half_cols[None, :] < cols // 2,
         )
         group = first_col // 32 + tl.arange(0, GROUPS)
         tl.store(
-            scale_ptr + _mx_scale_index(row, group[None, :], scale_cols),
+            scale_ptr + _mx_scale_index(row, col_offset // 32 + group[None, :], scale_cols),
             exponent.to(tl.uint8),
             mask=group[None, :] < cols // 32,
         )
@@ -139,7 +149,9 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
             _store_mxfp4_row(y, row, start, cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
 
     @triton.jit
-    def _swiglu_mxfp4_kernel(x_ptr, fp4_ptr, scale_ptr, cols, x_stride_row, scale_cols, BLOCK_K: tl.constexpr):
+    def _swiglu_mxfp4_kernel(
+        x_ptr, fp4_ptr, scale_ptr, cols, col_offset, row_cols, x_stride_row, scale_cols, BLOCK_K: tl.constexpr
+    ):
         row = tl.program_id(0)
         start = tl.program_id(1) * BLOCK_K
         col = start + tl.arange(0, BLOCK_K)
@@ -148,7 +160,7 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
         gate = tl.load(x_row + col, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(x_row + cols + col, mask=mask, other=0.0).to(tl.float32)
         y = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
-        _store_mxfp4_row(y, row, start, cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
+        _store_mxfp4_row_part(y, row, start, cols, col_offset, row_cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
 
     @triton.jit
     def _seq_major_output_mxfp4_kernel(
@@ -157,6 +169,8 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
         scale_ptr,
         seq_len,
         cols,
+        col_offset,
+        row_cols,
         chunk_cols,
         stride_rank,
         stride_s,
@@ -177,7 +191,7 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
             + col % chunk_cols
         )
         y = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        _store_mxfp4_row(y, row, start, cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
+        _store_mxfp4_row_part(y, row, start, cols, col_offset, row_cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
 
 
 def _check_rows(name: str, tensor: torch.Tensor) -> None:
@@ -246,18 +260,66 @@ def _(x, shift, scale, eps, x_after=None, shift_after=None, scale_after=None):
     return mxfp4_buffers(x.shape[0] * rows, x.shape[-1], x.device)
 
 
+def _swiglu_rows(x: torch.Tensor) -> torch.Tensor:
+    _check_rows("x", x)
+    return x.flatten(0, -2) if x.ndim > 2 else x
+
+
+def _launch_swiglu(rows, fp4, quant_scale, col_offset):
+    """Quantize the SwiGLU of ``[M, 2n]`` ``rows`` into columns ``col_offset`` onwards."""
+    cols = rows.shape[1] // 2
+    if rows.shape[0]:
+        _swiglu_mxfp4_kernel[(rows.shape[0], triton.cdiv(cols, _BLOCK_K))](
+            rows,
+            fp4,
+            quant_scale,
+            cols,
+            col_offset,
+            fp4.shape[1] * 2,
+            rows.stride(0),
+            quant_scale.shape[1],
+            BLOCK_K=_BLOCK_K,
+            num_warps=_NUM_WARPS,
+        )
+
+
+def _received_cols(received: torch.Tensor) -> int:
+    world_size, _, _, heads, head_dim = received.shape
+    if received.stride(4) != 1 or received.stride(3) != head_dim:
+        raise ValueError(f"Each received chunk must hold contiguous heads, got strides {received.stride()}.")
+    return world_size * heads * head_dim
+
+
+def _launch_seq_major_output(received, fp4, quant_scale, col_offset):
+    """Quantize the rows of a ``[P, s, b, h, d]`` receive buffer into columns ``col_offset`` onwards."""
+    _, seq_len, batch, heads, head_dim = received.shape
+    cols = _received_cols(received)
+    if batch * seq_len:
+        _seq_major_output_mxfp4_kernel[(batch * seq_len, triton.cdiv(cols, _BLOCK_K))](
+            received,
+            fp4,
+            quant_scale,
+            seq_len,
+            cols,
+            col_offset,
+            fp4.shape[1] * 2,
+            heads * head_dim,
+            received.stride(0),
+            received.stride(1),
+            received.stride(2),
+            quant_scale.shape[1],
+            BLOCK_K=_BLOCK_K,
+            num_warps=_NUM_WARPS,
+        )
+
+
 @torch.library.custom_op("xfuser::swiglu_mxfp4_quant", mutates_args=())
 def swiglu_mxfp4_quant(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """The quantized ``silu(x[..., :n]) * x[..., n:]`` rows of ``x``, ``[..., 2n]``; the
     rows may be strided, e.g. a column slice of a wider GEMM output."""
-    _check_rows("x", x)
-    rows = x.flatten(0, -2) if x.ndim > 2 else x
-    cols = rows.shape[1] // 2
-    fp4, quant_scale = mxfp4_buffers(rows.shape[0], cols, x.device)
-    if rows.shape[0]:
-        _swiglu_mxfp4_kernel[(rows.shape[0], triton.cdiv(cols, _BLOCK_K))](
-            rows, fp4, quant_scale, cols, rows.stride(0), quant_scale.shape[1], BLOCK_K=_BLOCK_K, num_warps=_NUM_WARPS
-        )
+    rows = _swiglu_rows(x)
+    fp4, quant_scale = mxfp4_buffers(rows.shape[0], rows.shape[1] // 2, x.device)
+    _launch_swiglu(rows, fp4, quant_scale, 0)
     return fp4, quant_scale
 
 
@@ -270,26 +332,9 @@ def _(x):
 def seq_major_attention_output_mxfp4_quant(received: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """The quantized ``[b * s, P * h * d]`` rows of a ``[P, s, b, h, d]`` output receive
     buffer, chunk ``p`` holding heads ``p * h`` onwards for this rank's ``s`` tokens."""
-    world_size, seq_len, batch, heads, head_dim = received.shape
-    if received.stride(4) != 1 or received.stride(3) != head_dim:
-        raise ValueError(f"Each received chunk must hold contiguous heads, got strides {received.stride()}.")
-    cols = world_size * heads * head_dim
-    fp4, quant_scale = mxfp4_buffers(batch * seq_len, cols, received.device)
-    if batch * seq_len:
-        _seq_major_output_mxfp4_kernel[(batch * seq_len, triton.cdiv(cols, _BLOCK_K))](
-            received,
-            fp4,
-            quant_scale,
-            seq_len,
-            cols,
-            heads * head_dim,
-            received.stride(0),
-            received.stride(1),
-            received.stride(2),
-            quant_scale.shape[1],
-            BLOCK_K=_BLOCK_K,
-            num_warps=_NUM_WARPS,
-        )
+    _, seq_len, batch, _, _ = received.shape
+    fp4, quant_scale = mxfp4_buffers(batch * seq_len, _received_cols(received), received.device)
+    _launch_seq_major_output(received, fp4, quant_scale, 0)
     return fp4, quant_scale
 
 
@@ -297,3 +342,31 @@ def seq_major_attention_output_mxfp4_quant(received: torch.Tensor) -> Tuple[torc
 def _(received):
     world_size, seq_len, batch, heads, head_dim = received.shape
     return mxfp4_buffers(batch * seq_len, world_size * heads * head_dim, received.device)
+
+
+@torch.library.custom_op("xfuser::attention_output_swiglu_mxfp4_quant", mutates_args=())
+def attention_output_swiglu_mxfp4_quant(
+    received: torch.Tensor, ff_hidden: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The quantized ``[b * s, P * h * d + n]`` rows of ``torch.cat([attention, swiglu],
+    dim=-1)``: the ``received`` rows as ``seq_major_attention_output_mxfp4_quant`` reads
+    them, then ``swiglu_mxfp4_quant`` of the matching ``[b, s, 2n]`` ``ff_hidden`` rows. The
+    attention width must be a multiple of the 32-column group."""
+    _, seq_len, batch, _, _ = received.shape
+    attention_cols = _received_cols(received)
+    if attention_cols % 32:
+        raise ValueError(f"The attention rows must fill whole 32-column groups, got {attention_cols} columns.")
+    rows = _swiglu_rows(ff_hidden)
+    if rows.shape[0] != batch * seq_len:
+        raise ValueError(f"ff_hidden has {rows.shape[0]} rows, the attention output {batch * seq_len}.")
+    fp4, quant_scale = mxfp4_buffers(batch * seq_len, attention_cols + rows.shape[1] // 2, received.device)
+    _launch_seq_major_output(received, fp4, quant_scale, 0)
+    _launch_swiglu(rows, fp4, quant_scale, attention_cols)
+    return fp4, quant_scale
+
+
+@attention_output_swiglu_mxfp4_quant.register_fake
+def _(received, ff_hidden):
+    world_size, seq_len, batch, heads, head_dim = received.shape
+    cols = world_size * heads * head_dim + ff_hidden.shape[-1] // 2
+    return mxfp4_buffers(batch * seq_len, cols, received.device)

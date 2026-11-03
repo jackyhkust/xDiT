@@ -88,6 +88,33 @@ def test_swiglu_quant_matches_hip_quant_of_swiglu(rows):
     assert fp4_diff < 1e-4 and scale_diff < 1e-3
 
 
+@pytest.mark.parametrize("world_size", [1, 8])
+@pytest.mark.parametrize("rows", [80, 522])
+def test_attention_output_swiglu_quant_matches_its_two_halves(world_size, rows):
+    # The merged output GEMM's input: attention rows, then the feed-forward hidden state.
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    batch, seq_len, heads, hidden = 2, rows // 2, 24 // world_size, 9216
+    received = _activations(world_size, seq_len, batch, heads, 128, generator=generator)
+    projected = _activations(batch, seq_len, 3 * 3072 + 2 * hidden, generator=generator)
+    ff_hidden = projected[..., 3 * 3072 :]
+    attention = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(received)
+    swiglu = torch.ops.xfuser.swiglu_mxfp4_quant(ff_hidden)
+
+    fp4, scale = torch.ops.xfuser.attention_output_swiglu_mxfp4_quant(received, ff_hidden)
+
+    attention_cols = 3072
+    assert fp4.shape == (rows, (attention_cols + hidden) // 2)
+    assert torch.equal(fp4[:, : attention_cols // 2], attention[0])
+    assert torch.equal(fp4[:, attention_cols // 2 :], swiglu[0])
+    positions = _scale_positions(rows, attention_cols + hidden, scale.shape[1], scale.device)
+    written = scale.flatten()[positions]
+    for part, (_, part_scale), cols in (
+        (written[:, : attention_cols // 32], attention, attention_cols),
+        (written[:, attention_cols // 32 :], swiglu, hidden),
+    ):
+        assert torch.equal(part, part_scale.flatten()[_scale_positions(rows, cols, part_scale.shape[1], scale.device)])
+
+
 @pytest.mark.parametrize("text_len", [0, 80])
 def test_layernorm_modulate_quant_matches_hip_quant_of_the_modulated_norm(text_len):
     generator = torch.Generator(device="cuda").manual_seed(0)

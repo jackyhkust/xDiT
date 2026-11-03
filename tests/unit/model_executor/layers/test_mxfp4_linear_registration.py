@@ -228,6 +228,51 @@ def test_concatenated_matches_quantizing_the_stacked_weight():
     assert ((actual - expected).norm() / expected.norm()).item() < 1e-3
 
 
+def test_stacked_along_input_refuses_layers_it_cannot_join(runtime, fake_aiter_quantization):
+    narrow = runtime.module.xFuserMXFP4Linear(8, 4, bias=False)
+    narrow._quantize_weights()
+    unquantized = runtime.module.xFuserMXFP4Linear(256, 4, bias=False)
+
+    with pytest.raises(ValueError, match="multiples of 256"):
+        runtime.module.xFuserMXFP4Linear.stacked_along_input([narrow, narrow])
+    with pytest.raises(ValueError, match="Quantize"):
+        runtime.module.xFuserMXFP4Linear.stacked_along_input([unquantized])
+    with pytest.raises(ValueError, match="same output width"):
+        runtime.module.xFuserMXFP4Linear.stacked_along_input([narrow, runtime.module.xFuserMXFP4Linear(8, 6)])
+
+
+@pytest.mark.accelerator
+def test_stacked_along_input_matches_quantizing_the_joined_weight():
+    # The packing and both preshuffles must keep each row block's K chunks in order.
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("aiter")
+    if not torch.cuda.is_available():
+        pytest.skip("AITER MXFP4 kernels need a GPU")
+    from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear
+
+    torch.manual_seed(0)
+    widths = (3072, 9216)
+    weights = [torch.randn(3072, k, device="cuda", dtype=torch.bfloat16) for k in widths]
+    layers = []
+    for weight in weights:
+        layer = xFuserMXFP4Linear(weight.shape[1], 3072, bias=False, device="cuda", dtype=torch.bfloat16)
+        layer.load_and_quantize_weights(weight)
+        layers.append(layer)
+    joined = xFuserMXFP4Linear(sum(widths), 3072, bias=False, device="cuda", dtype=torch.bfloat16)
+    joined.load_and_quantize_weights(torch.cat(weights, dim=1))
+
+    fused = xFuserMXFP4Linear.stacked_along_input(layers)
+
+    assert (fused.in_features, fused.out_features) == (sum(widths), 3072)
+    assert torch.equal(fused.weight_shuffle, joined.weight_shuffle)
+    assert torch.equal(fused.weight_scale, joined.weight_scale)
+    xs = [torch.randn(522, k, device="cuda", dtype=torch.bfloat16) for k in widths]
+    actual = fused(torch.cat(xs, dim=1)).float()
+    expected = sum(layer(x).float() for layer, x in zip(layers, xs))
+    # One GEMM accumulates in fp32 what the pair rounds to bf16 twice.
+    assert ((actual - expected).norm() / expected.norm()).item() < 1e-2
+
+
 def test_unquantized_state_dict_still_loads_strictly(runtime):
     torch = runtime.torch
     source = runtime.module.xFuserMXFP4Linear(8, 4, bias=True)

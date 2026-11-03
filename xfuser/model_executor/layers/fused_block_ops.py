@@ -8,7 +8,8 @@ op, a collective or a separately compiled block.
 - ``qk_norm_rope``: the same q and k as one ``[b, s, 2, h, d]`` buffer, for the paths that
   exchange q, k and v some other way, or not at all.
 - ``gated_residual_layernorm_modulate`` and its ``_mxfp4_quant`` variant: the previous
-  block's gated residual ``x + gate * (attn + ff)`` of one or two segments, then
+  block's gated residual ``x + gate * (attn + ff)`` of one or two segments (or
+  ``x + gate * out`` after a merged output GEMM), then
   ``(1 + scale) * layer_norm(.) + shift`` of the result, the next block's input, in bf16
   or quantized as ``mxfp4_fused_quant.layernorm_modulate_mxfp4_quant`` quantizes it.
 
@@ -117,8 +118,8 @@ if FUSED_BLOCK_OPS_AVAILABLE:
         gate1_ptr,
         shift1_ptr,
         mod_scale1_ptr,
-        attn_ptr,
-        ff_ptr,
+        branch0_ptr,
+        branch1_ptr,
         hidden_ptr,
         out_ptr,
         fp4_ptr,
@@ -143,11 +144,12 @@ if FUSED_BLOCK_OPS_AVAILABLE:
         shift1_stride_s,
         mod_scale1_stride_b,
         mod_scale1_stride_s,
-        attn_stride_b,
-        attn_stride_s,
-        ff_stride_b,
-        ff_stride_s,
+        branch0_stride_b,
+        branch0_stride_s,
+        branch1_stride_b,
+        branch1_stride_s,
         scale_cols,
+        TWO_BRANCHES: tl.constexpr,
         QUANTIZE: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -172,9 +174,12 @@ if FUSED_BLOCK_OPS_AVAILABLE:
 
         x = tl.load(x_row + col, mask=mask, other=0.0).to(tl.float32)
         gate = tl.load(gate_row + col, mask=mask, other=0.0).to(tl.float32)
-        attn = tl.load(_segment_row(attn_ptr, attn_stride_b, attn_stride_s, b, joint_s) + col, mask=mask, other=0.0)
-        ff = tl.load(_segment_row(ff_ptr, ff_stride_b, ff_stride_s, b, joint_s) + col, mask=mask, other=0.0)
-        hidden = (x + gate * (attn.to(tl.float32) + ff.to(tl.float32))).to(hidden_ptr.dtype.element_ty)
+        branch0_row = _segment_row(branch0_ptr, branch0_stride_b, branch0_stride_s, b, joint_s)
+        branch = tl.load(branch0_row + col, mask=mask, other=0.0).to(tl.float32)
+        if TWO_BRANCHES:
+            branch1_row = _segment_row(branch1_ptr, branch1_stride_b, branch1_stride_s, b, joint_s)
+            branch += tl.load(branch1_row + col, mask=mask, other=0.0).to(tl.float32)
+        hidden = (x + gate * branch).to(hidden_ptr.dtype.element_ty)
         tl.store(hidden_ptr + row.to(tl.int64) * cols + col, hidden, mask=mask)
 
         hidden = hidden.to(tl.float32)
@@ -299,16 +304,20 @@ def _(query, key, q_weight, k_weight, eps, cos, sin, heads):
     return query.new_empty(batch, seq_len, 2, heads, cols // heads)
 
 
-def _gated_residual_layernorm_modulate(xs, gates, shifts, scales, attn, ff, eps, quantize):
+def _gated_residual_layernorm_modulate(xs, gates, shifts, scales, branches, eps, quantize):
     """The joint ``[b, sum s_i, k]`` hidden state, then the bf16 modulated norm or its MXFP4
     values and scales, of one or two segments ``xs[i]`` ``[b, s_i, k]`` laid end to end along
-    the sequence, whose branch outputs are the matching rows of ``attn`` and ``ff``."""
+    the sequence, whose branch output is the sum of the matching rows of the one or two
+    ``branches`` (a block's attention and feed-forward outputs, or their merged GEMM's)."""
     if not 1 <= len(xs) <= 2 or not len(xs) == len(gates) == len(shifts) == len(scales):
         raise ValueError(f"Expected one or two segments with a gate, shift and scale each, got {len(xs)} segments.")
+    if not 1 <= len(branches) <= 2:
+        raise ValueError(f"Expected one or two branch outputs, got {len(branches)}.")
     batch, cols = xs[0].shape[0], xs[0].shape[-1]
     rows_per_batch = sum(x.shape[1] for x in xs)
-    if attn.shape != (batch, rows_per_batch, cols) or ff.shape != attn.shape:
-        raise ValueError(f"attn and ff must be [{batch}, {rows_per_batch}, {cols}], got {attn.shape}, {ff.shape}.")
+    if any(branch.shape != (batch, rows_per_batch, cols) for branch in branches):
+        shapes = [tuple(branch.shape) for branch in branches]
+        raise ValueError(f"The branch outputs must be [{batch}, {rows_per_batch}, {cols}], got {shapes}.")
     hidden = xs[0].new_empty(batch, rows_per_batch, cols)
     if quantize:
         out = hidden.new_empty(0)
@@ -324,17 +333,18 @@ def _gated_residual_layernorm_modulate(xs, gates, shifts, scales, attn, ff, eps,
                     f"{name} must be rows of {cols} contiguous columns, got {tensor.shape}, {tensor.stride()}."
                 )
         segments.append((x, *(tensor.expand_as(x) for tensor in (gate, shift, scale))))
-    for name, tensor in (("attn", attn), ("ff", ff)):
-        if tensor.stride(-1) != 1:
-            raise ValueError(f"{name} must be contiguous in its last dimension, got strides {tensor.stride()}.")
+    for branch in branches:
+        if branch.stride(-1) != 1:
+            raise ValueError(f"Branch outputs must be contiguous in their last dimension, got {branch.stride()}.")
     if len(segments) == 1:
         segments.append(segments[0])
+    branch0, branch1 = branches[0], branches[-1]
     if batch * rows_per_batch:
         _gated_residual_layernorm_modulate_kernel[(batch * rows_per_batch,)](
             *segments[0],
             *segments[1],
-            attn,
-            ff,
+            branch0,
+            branch1,
             hidden,
             out,
             fp4,
@@ -344,11 +354,12 @@ def _gated_residual_layernorm_modulate(xs, gates, shifts, scales, attn, ff, eps,
             cols,
             eps,
             *(stride for segment in segments for tensor in segment for stride in tensor.stride()[:2]),
-            attn.stride(0),
-            attn.stride(1),
-            ff.stride(0),
-            ff.stride(1),
+            branch0.stride(0),
+            branch0.stride(1),
+            branch1.stride(0),
+            branch1.stride(1),
             quant_scale.shape[1] if quantize else 0,
+            TWO_BRANCHES=len(branches) == 2,
             QUANTIZE=quantize,
             BLOCK=triton.next_power_of_2(cols),
             num_warps=_ROW_NUM_WARPS,
@@ -362,20 +373,19 @@ def gated_residual_layernorm_modulate(
     gates: List[torch.Tensor],
     shifts: List[torch.Tensor],
     scales: List[torch.Tensor],
-    attn: torch.Tensor,
-    ff: torch.Tensor,
+    branches: List[torch.Tensor],
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The joint hidden state ``x + gate * (attn + ff)`` of the segments ``xs`` and its
+    """The joint hidden state ``x + gate * sum(branches)`` of the segments ``xs`` and its
     modulated norm ``(1 + scale) * layer_norm(.) + shift``, both ``[b, sum s_i, k]``.
     ``gates``, ``shifts`` and ``scales`` are broadcast-shaped views per segment."""
-    hidden, out, _, _ = _gated_residual_layernorm_modulate(xs, gates, shifts, scales, attn, ff, eps, quantize=False)
+    hidden, out, _, _ = _gated_residual_layernorm_modulate(xs, gates, shifts, scales, branches, eps, quantize=False)
     return hidden, out
 
 
 @gated_residual_layernorm_modulate.register_fake
-def _(xs, gates, shifts, scales, attn, ff, eps):
-    return xs[0].new_empty(attn.shape), xs[0].new_empty(attn.shape)
+def _(xs, gates, shifts, scales, branches, eps):
+    return xs[0].new_empty(branches[0].shape), xs[0].new_empty(branches[0].shape)
 
 
 @torch.library.custom_op("xfuser::gated_residual_layernorm_modulate_mxfp4_quant", mutates_args=())
@@ -384,19 +394,18 @@ def gated_residual_layernorm_modulate_mxfp4_quant(
     gates: List[torch.Tensor],
     shifts: List[torch.Tensor],
     scales: List[torch.Tensor],
-    attn: torch.Tensor,
-    ff: torch.Tensor,
+    branches: List[torch.Tensor],
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``gated_residual_layernorm_modulate`` with the modulated norm returned as the MXFP4
     values and shuffled scales of its ``[b * sum s_i, k]`` rows (see ``mxfp4_fused_quant``)."""
     hidden, _, fp4, quant_scale = _gated_residual_layernorm_modulate(
-        xs, gates, shifts, scales, attn, ff, eps, quantize=True
+        xs, gates, shifts, scales, branches, eps, quantize=True
     )
     return hidden, fp4, quant_scale
 
 
 @gated_residual_layernorm_modulate_mxfp4_quant.register_fake
-def _(xs, gates, shifts, scales, attn, ff, eps):
-    batch, rows, cols = attn.shape
-    return (xs[0].new_empty(attn.shape), *mxfp4_fused_quant.mxfp4_buffers(batch * rows, cols, attn.device))
+def _(xs, gates, shifts, scales, branches, eps):
+    batch, rows, cols = branches[0].shape
+    return (xs[0].new_empty(branches[0].shape), *mxfp4_fused_quant.mxfp4_buffers(batch * rows, cols, xs[0].device))

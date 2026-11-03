@@ -78,4 +78,4 @@ def test_shipped_flux3_table_is_in_aiter_format():
     # asm kernels without split-K: the same output bits as AITER's default kernel choice
     assert table.kernelName.str.startswith("_ZN").all()
     assert (table.splitK == 0).all()
-    assert set(zip(table.N, table.K)) == {(27648, 3072), (3072, 3072), (3072, 9216)}
+    assert set(zip(table.N, table.K)) == {(27648, 3072), (3072, 3072), (3072, 9216), (3072, 12288)}

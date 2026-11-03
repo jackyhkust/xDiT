@@ -69,6 +69,24 @@ def test_fusing_stacks_the_four_input_projections_of_every_block():
     assert type(wrapper.mode_blocks["image"][0]).__name__ == "_FusedFlux3ModeTransformerBlock"
 
 
+def test_fusing_joins_the_attention_and_feed_forward_outputs_of_fused_blocks():
+    import torch
+
+    wrapper = transformer_flux3.xFuserFlux3Transformer2DWrapper(**TINY, flow_map=True)
+    block = wrapper.mode_blocks["image"][0]
+    to_out, linear_out = block.attn.to_out[0], block.ff.linear_out
+    attention, hidden = torch.randn(3, to_out.in_features), torch.randn(3, linear_out.in_features)
+    expected = to_out(attention) + linear_out(hidden)
+
+    assert transformer_flux3.fuse_block_output_projections(wrapper) == 0  # needs the input fusion first
+    transformer_flux3.fuse_block_input_projections(wrapper)
+    assert transformer_flux3.fuse_block_output_projections(wrapper) == 4
+    assert transformer_flux3.fuse_block_output_projections(wrapper) == 0
+
+    assert not hasattr(block.attn, "to_out") and not hasattr(block.ff, "linear_out")
+    torch.testing.assert_close(block.fused_out(torch.cat([attention, hidden], dim=-1)), expected)
+
+
 def test_fusing_skips_blocks_whose_layers_cannot_be_stacked():
     import torch
 

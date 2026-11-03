@@ -132,12 +132,17 @@ def _sp_worker(rank, world_size, init_method, ulysses_degree, ring_degree):
     from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
 
     try:
-        from xfuser.model_executor.models.transformers.transformer_flux3 import fuse_block_input_projections
+        from xfuser.model_executor.models.transformers.transformer_flux3 import (
+            fuse_block_input_projections,
+            fuse_block_output_projections,
+        )
 
         device = _setup(rank, world_size, init_method, ulysses_degree, ring_degree)
         stock = _tiny_model(device)
-        wrappers = {"separate": _wrapper_of(stock, device), "fused": _wrapper_of(stock, device)}
-        assert fuse_block_input_projections(wrappers["fused"]) == 2 + 2 + 2 + 2
+        wrappers = {name: _wrapper_of(stock, device) for name in ("separate", "fused", "fused input and output")}
+        for name in ("fused", "fused input and output"):
+            assert fuse_block_input_projections(wrappers[name]) == 2 + 2 + 2 + 2
+        assert fuse_block_output_projections(wrappers["fused input and output"]) == 2 + 2 + 2 + 2
 
         for layout in LAYOUTS:
             for with_references in (False, True):
