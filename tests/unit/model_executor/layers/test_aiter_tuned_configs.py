@@ -3,10 +3,11 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
-import pandas as pd
 import pytest
 
 from xfuser.model_executor.layers import aiter_tuned_configs as configs
+
+pd = pytest.importorskip("pandas")
 
 COLUMNS = ["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName", "tflops", "bw", "errRatio"]
 
