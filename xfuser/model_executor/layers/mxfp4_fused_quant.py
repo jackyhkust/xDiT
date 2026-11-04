@@ -176,6 +176,8 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
         stride_s,
         stride_b,
         scale_cols,
+        descale_ptr,
+        DEQUANT: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -191,6 +193,9 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
             + col % chunk_cols
         )
         y = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        if DEQUANT:
+            # The FP8 exchange's dequantization, (x.float() * descale).to(bf16).
+            y = (y * tl.load(descale_ptr)).to(tl.bfloat16).to(tl.float32)
         _store_mxfp4_row_part(y, row, start, cols, col_offset, row_cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
 
 
@@ -290,10 +295,13 @@ def _received_cols(received: torch.Tensor) -> int:
     return world_size * heads * head_dim
 
 
-def _launch_seq_major_output(received, fp4, quant_scale, col_offset):
-    """Quantize the rows of a ``[P, s, b, h, d]`` receive buffer into columns ``col_offset`` onwards."""
+def _launch_seq_major_output(received, fp4, quant_scale, col_offset, descale=None):
+    """Quantize the rows of a ``[P, s, b, h, d]`` receive buffer into columns ``col_offset`` onwards,
+    an FP8 one dequantized by its one-element ``descale`` first."""
     _, seq_len, batch, heads, head_dim = received.shape
     cols = _received_cols(received)
+    if (descale is None) != (received.element_size() != 1):
+        raise ValueError(f"A descale goes with an FP8 receive buffer, got {received.dtype} and descale {descale}.")
     if batch * seq_len:
         _seq_major_output_mxfp4_kernel[(batch * seq_len, triton.cdiv(cols, _BLOCK_K))](
             received,
@@ -308,6 +316,8 @@ def _launch_seq_major_output(received, fp4, quant_scale, col_offset):
             received.stride(1),
             received.stride(2),
             quant_scale.shape[1],
+            received if descale is None else descale,
+            DEQUANT=descale is not None,
             BLOCK_K=_BLOCK_K,
             num_warps=_NUM_WARPS,
         )
@@ -329,29 +339,33 @@ def _(x):
 
 
 @torch.library.custom_op("xfuser::seq_major_attention_output_mxfp4_quant", mutates_args=())
-def seq_major_attention_output_mxfp4_quant(received: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def seq_major_attention_output_mxfp4_quant(
+    received: torch.Tensor, descale: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """The quantized ``[b * s, P * h * d]`` rows of a ``[P, s, b, h, d]`` output receive
-    buffer, chunk ``p`` holding heads ``p * h`` onwards for this rank's ``s`` tokens."""
+    buffer, chunk ``p`` holding heads ``p * h`` onwards for this rank's ``s`` tokens. An FP8
+    buffer (FP8 Ulysses comms) comes with its one-element ``descale``."""
     _, seq_len, batch, _, _ = received.shape
     fp4, quant_scale = mxfp4_buffers(batch * seq_len, _received_cols(received), received.device)
-    _launch_seq_major_output(received, fp4, quant_scale, 0)
+    _launch_seq_major_output(received, fp4, quant_scale, 0, descale)
     return fp4, quant_scale
 
 
 @seq_major_attention_output_mxfp4_quant.register_fake
-def _(received):
+def _(received, descale=None):
     world_size, seq_len, batch, heads, head_dim = received.shape
     return mxfp4_buffers(batch * seq_len, world_size * heads * head_dim, received.device)
 
 
 @torch.library.custom_op("xfuser::attention_output_swiglu_mxfp4_quant", mutates_args=())
 def attention_output_swiglu_mxfp4_quant(
-    received: torch.Tensor, ff_hidden: torch.Tensor
+    received: torch.Tensor, ff_hidden: torch.Tensor, descale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """The quantized ``[b * s, P * h * d + n]`` rows of ``torch.cat([attention, swiglu],
     dim=-1)``: the ``received`` rows as ``seq_major_attention_output_mxfp4_quant`` reads
-    them, then ``swiglu_mxfp4_quant`` of the matching ``[b, s, 2n]`` ``ff_hidden`` rows. The
-    attention width must be a multiple of the 32-column group."""
+    them (with ``descale`` for an FP8 buffer), then ``swiglu_mxfp4_quant`` of the matching
+    ``[b, s, 2n]`` ``ff_hidden`` rows. The attention width must be a multiple of the
+    32-column group."""
     _, seq_len, batch, _, _ = received.shape
     attention_cols = _received_cols(received)
     if attention_cols % 32:
@@ -360,13 +374,13 @@ def attention_output_swiglu_mxfp4_quant(
     if rows.shape[0] != batch * seq_len:
         raise ValueError(f"ff_hidden has {rows.shape[0]} rows, the attention output {batch * seq_len}.")
     fp4, quant_scale = mxfp4_buffers(batch * seq_len, attention_cols + rows.shape[1] // 2, received.device)
-    _launch_seq_major_output(received, fp4, quant_scale, 0)
+    _launch_seq_major_output(received, fp4, quant_scale, 0, descale)
     _launch_swiglu(rows, fp4, quant_scale, attention_cols)
     return fp4, quant_scale
 
 
 @attention_output_swiglu_mxfp4_quant.register_fake
-def _(received, ff_hidden):
+def _(received, ff_hidden, descale=None):
     world_size, seq_len, batch, heads, head_dim = received.shape
     cols = world_size * heads * head_dim + ff_hidden.shape[-1] // 2
     return mxfp4_buffers(batch * seq_len, cols, received.device)

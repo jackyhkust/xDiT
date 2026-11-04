@@ -5,6 +5,9 @@ op, a collective or a separately compiled block.
   written straight into the Ulysses sequence-major send buffer ``[P, s, b, 3, h/P, d]``
   (see ``usp._seq_major_qkv_send``) with v copied alongside, instead of a norm kernel and a
   pack kernel.
+- ``qk_norm_rope_seq_major_send_fp8``: the same send buffer in FP8 for FP8 Ulysses comms,
+  with q and k Hadamard-rotated and q, k, v quantized by their calibrated per-tensor scales,
+  instead of the rotation GEMMs, three quantization passes and three exchanges of USP's path.
 - ``qk_norm_rope``: the same q and k as one ``[b, s, 2, h, d]`` buffer, for the paths that
   exchange q, k and v some other way, or not at all.
 - ``gated_residual_layernorm_modulate`` and its ``_mxfp4_quant`` variant: the previous
@@ -37,6 +40,9 @@ except ImportError:
 _QK_HEADS_PER_PROGRAM = 8
 _QK_NUM_WARPS = 2
 _ROW_NUM_WARPS = 4
+# The FP8 q/k kernel's rotation is a tl.dot, whose rows (heads) must number at least 16.
+_QK_FP8_HEADS_PER_PROGRAM = 16
+_QK_FP8_NUM_WARPS = 4
 
 
 if FUSED_BLOCK_OPS_AVAILABLE:
@@ -103,6 +109,79 @@ if FUSED_BLOCK_OPS_AVAILABLE:
         if WRITE_V:
             v = tl.load(v_ptr + in_offsets, mask=mask, other=0.0)
             tl.store(out_ptr + 2 * out_stride_which + out_offsets, v.to(out_dtype), mask=mask)
+
+    @triton.jit
+    def _fp8_per_tensor(x, scale_ptr, fp8_max):
+        """``(x / scale).clamp(-fp8_max, fp8_max)`` in fp32, as ``fp8_comms._per_tensor_quant``."""
+        return tl.clamp(tl.div_rn(x, tl.load(scale_ptr)), -fp8_max, fp8_max)
+
+    @triton.jit
+    def _qk_norm_rope_fp8_send_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        rotation_ptr,
+        q_scale_ptr,
+        k_scale_ptr,
+        v_scale_ptr,
+        out_ptr,
+        seq_len,
+        heads,
+        heads_per_rank,
+        eps,
+        fp8_max,
+        in_stride_b,
+        in_stride_s,
+        rope_stride_s,
+        out_stride_rank,
+        out_stride_s,
+        out_stride_b,
+        out_stride_which,
+        HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+    ):
+        """``_qk_norm_rope_kernel``'s sequence-major send buffer in FP8: q and k rounded to
+        bf16 after the norm and RoPE, rotated by the bf16 ``[d, d]`` Hadamard matrix and rounded
+        again (``hadamard.rotate_qk``), then q, k and v quantized with their per-tensor scales."""
+        index = tl.program_id(0)
+        b = index // seq_len
+        s = index % seq_len
+        head = tl.program_id(1) * HEADS + tl.arange(0, HEADS)[:, None]
+        dim = tl.arange(0, HEAD_DIM)[None, :]
+        mask = head < heads
+        in_offsets = b.to(tl.int64) * in_stride_b + s.to(tl.int64) * in_stride_s + head * HEAD_DIM + dim
+        out_offsets = (
+            (head // heads_per_rank).to(tl.int64) * out_stride_rank
+            + s.to(tl.int64) * out_stride_s
+            + b.to(tl.int64) * out_stride_b
+            + (head % heads_per_rank) * HEAD_DIM
+            + dim
+        )
+        out_dtype = out_ptr.dtype.element_ty
+        cos = tl.load(cos_ptr + s.to(tl.int64) * rope_stride_s + dim).to(tl.float32)
+        sin = tl.load(sin_ptr + s.to(tl.int64) * rope_stride_s + dim).to(tl.float32)
+        rotation = tl.load(rotation_ptr + tl.arange(0, HEAD_DIM)[:, None] * HEAD_DIM + dim)
+
+        q = tl.load(q_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
+        q = _rms_norm_rope(q, tl.load(q_weight_ptr + dim).to(tl.float32), cos, sin, eps, HEADS, HEAD_DIM)
+        q = tl.dot(q.to(tl.bfloat16), rotation).to(tl.bfloat16).to(tl.float32)
+        tl.store(out_ptr + out_offsets, _fp8_per_tensor(q, q_scale_ptr, fp8_max).to(out_dtype), mask=mask)
+        k = tl.load(k_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
+        k = _rms_norm_rope(k, tl.load(k_weight_ptr + dim).to(tl.float32), cos, sin, eps, HEADS, HEAD_DIM)
+        k = tl.dot(k.to(tl.bfloat16), rotation).to(tl.bfloat16).to(tl.float32)
+        tl.store(
+            out_ptr + out_stride_which + out_offsets, _fp8_per_tensor(k, k_scale_ptr, fp8_max).to(out_dtype), mask=mask
+        )
+        v = tl.load(v_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
+        tl.store(
+            out_ptr + 2 * out_stride_which + out_offsets,
+            _fp8_per_tensor(v, v_scale_ptr, fp8_max).to(out_dtype),
+            mask=mask,
+        )
 
     @triton.jit
     def _segment_row(ptr, stride_b, stride_s, b, s):
@@ -278,6 +357,77 @@ def qk_norm_rope_seq_major_send(
 def _(query, key, value, q_weight, k_weight, eps, cos, sin, heads, world_size):
     batch, seq_len, cols = query.shape
     return query.new_empty(world_size, seq_len, batch, 3, heads // world_size, cols // heads)
+
+
+@torch.library.custom_op("xfuser::qk_norm_rope_seq_major_send_fp8", mutates_args=())
+def qk_norm_rope_seq_major_send_fp8(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    heads: int,
+    world_size: int,
+    rotation: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    fp8_dtype: torch.dtype,
+) -> torch.Tensor:
+    """``qk_norm_rope_seq_major_send`` in ``fp8_dtype`` for FP8 Ulysses comms: q and k also
+    rotated by the bf16 ``[d, d]`` ``rotation`` (``hadamard.rotate_qk``), then q, k and v
+    quantized with the one-element per-tensor scales, as ``fp8_comms`` quantizes them."""
+    head_dim = _check_qk_inputs(query, key, value, q_weight, k_weight, cos, sin, heads)
+    if heads % world_size:
+        raise ValueError(f"{heads} heads do not split over {world_size} ranks.")
+    if rotation.shape != (head_dim, head_dim) or rotation.dtype != torch.bfloat16 or not rotation.is_contiguous():
+        raise ValueError(f"rotation must be a contiguous bf16 [{head_dim}, {head_dim}] matrix.")
+    for name, scale in (("q_scale", q_scale), ("k_scale", k_scale), ("v_scale", v_scale)):
+        if scale.numel() != 1 or scale.dtype != torch.float32:
+            raise ValueError(f"{name} must be a one-element fp32 tensor, got {tuple(scale.shape)} {scale.dtype}.")
+    batch, seq_len, _ = query.shape
+    out = query.new_empty(world_size, seq_len, batch, 3, heads // world_size, head_dim, dtype=fp8_dtype)
+    if batch * seq_len:
+        _qk_norm_rope_fp8_send_kernel[(batch * seq_len, triton.cdiv(heads, _QK_FP8_HEADS_PER_PROGRAM))](
+            query,
+            key,
+            value,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            rotation,
+            q_scale,
+            k_scale,
+            v_scale,
+            out,
+            seq_len,
+            heads,
+            heads // world_size,
+            eps,
+            torch.finfo(fp8_dtype).max,
+            query.stride(0),
+            query.stride(1),
+            cos.stride(0),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            HEADS=_QK_FP8_HEADS_PER_PROGRAM,
+            HEAD_DIM=head_dim,
+            num_warps=_QK_FP8_NUM_WARPS,
+        )
+    return out
+
+
+@qk_norm_rope_seq_major_send_fp8.register_fake
+def _(query, key, value, q_weight, k_weight, eps, cos, sin, heads, world_size, rotation, q_scale, k_scale, v_scale,
+      fp8_dtype):
+    batch, seq_len, cols = query.shape
+    return query.new_empty(world_size, seq_len, batch, 3, heads // world_size, cols // heads, dtype=fp8_dtype)
 
 
 @torch.library.custom_op("xfuser::qk_norm_rope", mutates_args=())

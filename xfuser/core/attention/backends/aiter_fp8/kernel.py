@@ -127,6 +127,35 @@ def _pre_quantized(query, key, value, call: AttnCall):
     return from_bshd(out), None
 
 
+MHA_V4_AVAILABLE = _USE_MHA_V4
+
+
+def mha_v4_pre_quantized_bshd(q, k, v, q_descale, k_descale, v_descale, out):
+    """MHA v4 on per-tensor FP8 BSHD q, k, v into the bf16 BSHD ``out``. The operands may be
+    strided views (e.g. of a Ulysses receive buffer) with contiguous rows: the kernel reads
+    and writes them in place, with the same result as on contiguous copies."""
+    if not _USE_MHA_V4:
+        raise RuntimeError("MHA v4 is not available in this AITER build or on this GPU.")
+    fp8 = native_fp8_format()
+    per_tensor = AttentionScaleMode.F32_PER_TENSOR
+    return mha_v4_packed(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8,
+        fp8,
+        fp8,
+        per_tensor,
+        per_tensor,
+        per_tensor,
+        softmax_scale=q.shape[-1] ** -0.5,
+        out=out,
+    )
+
+
 def _mha_v4(query, key, value, call: AttnCall):
     """The raw MHA v4 API owns canonical Q/K rotation and quantisation."""
     q, k, v = to_bshd(query, key, value, contiguous=True)
