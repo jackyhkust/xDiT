@@ -198,6 +198,56 @@ For startup adapter fusion on FLUX.1-dev and MiniMax-H3 Turbo, see [LoRA support
 | `--group_offload_low_cpu_mem` | With `--enable_group_cpu_offload`, pin each tensor as it is offloaded rather than pre-pinning whole components. Keeps host RAM flat at the cost of some of the streaming speedup | False |
 | `--attention_backend` | Attention backend selection | None |
 
+### Quantized Attention A2A
+
+Wan2.2 T2V can replace the Ulysses input RCCL all-to-all with AITER's
+intranode Attention A2A transport. The output hop remains RCCL.
+
+```bash
+xdit \
+    --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --ulysses_degree 8 \
+    --attention_backend aiter_fp8 \
+    --attention_a2a auto \
+    --use_torch_compile \
+    --prompt "A motorcycle cruising along a coastal highway"
+```
+
+`--attention_a2a auto` selects the transport recipe from the dense attention
+backend. Explicit profiles are also available:
+
+- `aiter_fp8` uses `e4m3-e4m3`.
+- `aiter_i8fp8` uses `int8-e4m3`.
+- `aiter_mxfp8` uses `mxfp8-e4m3`.
+- `aiter_f8f6` uses `e4m3-mxfp6`.
+- `aiter_mxfp6` uses `mxfp6-e4m3`.
+- `aiter_f6f6` uses `mxfp6-mxfp6`.
+- `aiter_f6f4` uses `mxfp6-mxfp4`.
+- `aiter_mxfp4` and `aiter_f4f4` use `mxfp4-mxfp4`.
+
+`--attention_a2a_hadamard auto` applies each recipe's validated placement.
+It can be overridden with `preprocess`, `transport`, `epilogue`, or `none`.
+
+For `aiter_f6f6`, `aiter_f6f4`, `aiter_mxfp4`, and `aiter_f4f4`, xDiT
+passes the unpadded K/V length to AITER so it emits compact packed K/V
+directly while retaining padded Q when padding is confined to the final rank's
+input shard. Profiles with sequence-wide K or V scales, and shapes whose
+padding spans multiple rank shards, use xDiT's existing post-transport
+trimming fallback.
+
+The feature requires AITER's public `AttentionA2AIntraNodeOp` per-role packed
+result API, MORI SHMEM, batch size one, intranode Ulysses degree 2, 4, or 8,
+head dimension 128, and no ring parallelism or Sparge head balancing. MX
+profiles require gfx950. Initialization collectively checks every rank for
+these requirements before symmetric allocation; MORI is not imported when the
+feature is disabled.
+
+On compatible Torch builds xDiT uses the Tier-2 asynchronous Inductor
+collective/wait lowering. If that private contract is unavailable it falls
+back to the Tier-1 ordered custom-op path. If neither path is supported,
+initialization fails and the run must disable the feature with
+`--attention_a2a none`.
+
 ### Loading and Quantization Contract
 
 The quantization flags select model-declared linear-layer targets; they do not quantize every pipeline component. Unless noted below, the VAE and untargeted text encoders retain the pipeline dtype.
@@ -334,9 +384,10 @@ A listed target is only half the answer: the format still has to survive the har
 Several runners hold part of an FP4 target at FP8 where full FP4 costs too much
 quality: Wan 2.1 I2V and T2V keep blocks 0-9 and 30-39, Wan 2.2 TI2V keeps
 blocks 0, 1, 28, and 29 plus the `.net.0.proj` and `.net.2` leaves, Cosmos3-Super
-keeps layers 0-9 and 54-63, and both MiniMax-H3 runners keep the `attn.to_out.0`,
-`ff.net.2`, and `adaln_proj.linear` leaves. Wan 2.2 I2V and T2V declare no block
-overrides at all. `--fp8_precision_override_prefix_patterns` and
+keeps layers 0-9 and 54-63, and both MiniMax-H3 runners keep blocks 0, 1, and
+25-49 plus the `attn.to_out.0`, `ff.net.2`, and `adaln_proj.linear` leaves. Wan
+2.2 I2V and T2V declare no block overrides at all.
+`--fp8_precision_override_prefix_patterns` and
 `--fp8_precision_override_suffix_patterns` replace the declared prefix or suffix
 list rather than adding to it.
 
@@ -355,6 +406,7 @@ list rather than adding to it.
 - CPU/model offload can be combined with AITER FP8; converted leaves are evicted as they are processed. Other quantization backends first require their block or component on the GPU.
 - `--enable_group_cpu_offload` is rejected with FP4 on the AITER backend, including the hybrid FP8/FP4 mode, because packed FP4 weights survive neither leg of the offload: with `--group_offload_low_cpu_mem` the hook pins each tensor and torch has no `pin_memory` for `Float4_e2m1fn_x2`, and without it AITER binds a device from the parameter it is handed, so a host parameter resolves to an invalid ordinal and aborts the process. Offload at FP8 or bf16, or run FP4 without offload.
 - Offload works across ranks: each rank onloads to its own local device, so it combines with a parallel degree and with the replicated meta load.
+- MiniMax-H3 supports only `--enable_model_cpu_offload`, and there it keeps the transformer and both VAEs on the device and streams the Qwen3-VL text encoder from pinned host memory (leaf-level group offload), which costs one weight transfer per request. The transformer stays resident, so FP4 still quantizes on the device. Model offload is for single-GPU runs: multi-GPU runs use `--text_encoder_tp_degree` instead, and sequential and group offload are rejected.
 - `--enable_group_cpu_offload` and `--enable_sequential_cpu_offload` are rejected with `--fully_shard_degree > 1`, because both reach inside a parameter that sharding has replaced with a DTensor: the group hook asks each parameter whether it is pinned, for which torch registers no sharding strategy, and sequential offload rebuilds each parameter as it moves it, which needs a spec a plain tensor does not carry. `--enable_model_cpu_offload` moves whole components and does work on top of a sharded, blockwise-filled load. Combining the two does mean a component's weights are driven by two mechanisms at once — FSDP2 all-gathers the parameters, the offload hook moves the module — so anything a kernel needs that is not a parameter has to be checked against the launch device rather than assumed to have travelled: the AITER block-scale FP8 layer keeps its weight scale beside the weight as a replicated buffer and co-locates it in `forward` for that reason.
 
 #### Load and Quantization Examples
