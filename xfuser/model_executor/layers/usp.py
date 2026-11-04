@@ -260,6 +260,35 @@ def ulysses_aiter_attention_from_send(send, valid_kv_len=None):
     return received.view(world_size, seq_len // world_size, b, heads, d)
 
 
+def ulysses_aiter_fp8_attention_from_send(send, fp8_comms, valid_kv_len=None):
+    """``ulysses_aiter_attention_from_send`` with FP8 Ulysses comms and AITER's FP8 attention.
+
+    ``send`` is the FP8 ``[P, s, b, 3, h/P, d]`` send buffer, q and k Hadamard-rotated and
+    q, k, v quantized with ``fp8_comms``'s per-layer scales (``Fp8CommsCall``), as USP's FP8
+    path quantizes them. MHA v4 reads the received q, k, v views and writes the output send
+    buffer in place; the output travels in FP8 with ``fp8_comms.o_scale``. Returns the FP8
+    output receive buffer ``[P, s, b, h/P, d]``, which dequantizes as ``x.float() * o_scale``.
+    """
+    from xfuser.core.attention.backends.aiter_fp8.kernel import mha_v4_pre_quantized_bshd
+    from xfuser.core.distributed.fp8_comms import _per_tensor_quant
+
+    world_size = get_ulysses_parallel_world_size()
+    received = _sdpa_all_to_all_single(send)
+    query, key, value = _seq_major_qkv_views(received)
+    if valid_kv_len is not None:
+        if not 0 < valid_kv_len <= key.shape[1]:
+            raise ValueError(f"valid_kv_len must be in [1, {key.shape[1]}], got {valid_kv_len}.")
+        key, value = key[:, :valid_kv_len], value[:, :valid_kv_len]
+    b, seq_len, heads, d = query.shape
+    out = torch.empty(seq_len, b, heads, d, dtype=torch.bfloat16, device=query.device)
+    mha_v4_pre_quantized_bshd(
+        query, key, value, fp8_comms.q_scale, fp8_comms.k_scale, fp8_comms.v_scale, out.transpose(0, 1)
+    )
+    out_fp8, _ = _per_tensor_quant(out, fp8_comms.o_scale)
+    received = _sdpa_all_to_all_single(out_fp8)
+    return received.view(world_size, seq_len // world_size, b, heads, d)
+
+
 def _combined_gqa_qkv_all_to_all(q, k, v, *extra):
     """Exchange GQA Q/K/V in one collective without expanding KV heads.
 

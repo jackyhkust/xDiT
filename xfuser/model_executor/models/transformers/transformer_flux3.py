@@ -1,5 +1,5 @@
 import functools
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,7 @@ from diffusers.models.transformers.transformer_flux3 import (
     _get_qkv_projections,
 )
 
+from xfuser.core.attention.numerics import hadamard
 from xfuser.core.attention.spec import AttentionBackendType
 from xfuser.core.distributed import (
     get_ring_parallel_world_size,
@@ -22,7 +23,11 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
-from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
+from xfuser.core.distributed.fp8_comms import (
+    _FP8_DTYPE as FP8_COMMS_DTYPE,
+    Fp8CommsCall,
+    register_fp8_comms_eligible_modules,
+)
 from xfuser.model_executor.layers import fused_block_ops, mxfp4_fused_quant
 from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear
 from xfuser.model_executor.layers import usp_sdma
@@ -32,6 +37,7 @@ from xfuser.model_executor.layers.usp import (
     seq_major_attention_output,
     ulysses_aiter_attention,
     ulysses_aiter_attention_from_send,
+    ulysses_aiter_fp8_attention_from_send,
 )
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
@@ -47,6 +53,21 @@ FUSED_MXFP4_QUANT = True
 # block's gated residual runs in the next block's LayerNorm kernel (see fused_block_ops).
 FUSED_QK_NORM_ROPE = True
 FUSED_BLOCK_RESIDUAL = True
+
+
+class SeqMajorFp8Output(NamedTuple):
+    """The FP8 ``[P, s, b, h/P, d]`` output receive buffer of the FP8 sequence-major
+    exchange and its one-element descale."""
+
+    received: torch.Tensor
+    descale: torch.Tensor
+
+
+def _seq_major_rows(received: torch.Tensor, descale: Optional[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
+    """The ``[b, s, h * d]`` rows of an output receive buffer, an FP8 one dequantized as
+    ``fp8_comms`` dequantizes USP's output exchange."""
+    rows = seq_major_attention_output(received)
+    return rows if descale is None else (rows.float() * descale).to(dtype)
 
 
 def _takes_quantized_input(layer: torch.nn.Module) -> bool:
@@ -95,18 +116,30 @@ class xFuserFlux3AttnProcessor:
         self.valid_kv_len: Optional[int] = None
         self.local = False
 
-    def _uses_seq_major_ulysses(self, attn: Flux3Attention) -> bool:
+    def _seq_major_ulysses(self, attn: Flux3Attention) -> Optional[str]:
+        """``"bf16"`` or ``"fp8"`` when this call takes the sequence-major exchange, else None.
+
+        ``"fp8"`` is AITER's FP8 attention with FP8 Ulysses comms once this layer's scales
+        are calibrated; the calibration pass itself runs through USP, which measures them.
+        """
         if self.local or not self.seq_major_ulysses:
-            return False
+            return None
         ulysses_degree = get_ulysses_parallel_world_size()
         if ulysses_degree <= 1 or get_ring_parallel_world_size() > 1 or attn.heads % ulysses_degree:
-            return False
+            return None
         state = get_runtime_state()
-        return (
-            state.attention_backend == AttentionBackendType.AITER
-            and state.fp8_comms is None
-            and not getattr(state, "_xdit_compile_capture_bypass_attention", False)
-        )
+        if getattr(state, "_xdit_compile_capture_bypass_attention", False):
+            return None
+        if state.attention_backend == AttentionBackendType.AITER and state.fp8_comms is None:
+            return "bf16"
+        if state.attention_backend != AttentionBackendType.AITER_FP8 or state.fp8_comms is None:
+            return None
+        from xfuser.core.attention.backends.aiter_fp8.kernel import MHA_V4_AVAILABLE
+
+        if not MHA_V4_AVAILABLE or attn.head_dim != 128 or getattr(attn, "fp8_comms_owner", None) is None:
+            return None
+        model_state = state.fp8_comms.get_model_state(attn.fp8_comms_owner)
+        return "fp8" if model_state is not None and model_state.synced else None
 
     def __call__(
         self,
@@ -130,13 +163,16 @@ class xFuserFlux3AttnProcessor:
     ) -> torch.Tensor:
         """Attention and output projection from already projected ``[b, s, h * d]`` q, k and v."""
         attention_output = self.attend_unprojected(attn, query, key, value, image_rotary_emb)
+        descale = None
+        if isinstance(attention_output, SeqMajorFp8Output):
+            attention_output, descale = attention_output
         if attention_output.ndim == 5:
             if _takes_quantized_input(attn.to_out[0]):
                 _, seq_len, batch, _, _ = attention_output.shape
-                quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(attention_output)
+                quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(attention_output, descale)
                 hidden_states = attn.to_out[0].forward_quantized(*quantized, (batch, seq_len))
             else:
-                hidden_states = attn.to_out[0](seq_major_attention_output(attention_output))
+                hidden_states = attn.to_out[0](_seq_major_rows(attention_output, descale, query.dtype))
         else:
             hidden_states = attn.to_out[0](attention_output)
         return attn.to_out[1](hidden_states)
@@ -148,11 +184,31 @@ class xFuserFlux3AttnProcessor:
         key: torch.Tensor,
         value: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, "SeqMajorFp8Output"]:
         """``attend`` before the output projection: the ``[P, s, b, h/P, d]`` receive buffer
-        of the sequence-major exchange, or else ``[b, s, h * d]`` rows."""
+        of the sequence-major exchange (in FP8 with its descale for FP8 comms), or else
+        ``[b, s, h * d]`` rows."""
         fused_args = _fused_qk_norm_rope_args(attn, query, key, value, image_rotary_emb)
-        seq_major = self._uses_seq_major_ulysses(attn)
+        seq_major = self._seq_major_ulysses(attn)
+        if seq_major == "fp8" and fused_args is not None:
+            send = torch.ops.xfuser.qk_norm_rope_seq_major_send_fp8(
+                query,
+                key,
+                value,
+                *fused_args,
+                attn.heads,
+                get_ulysses_parallel_world_size(),
+                hadamard.matrix(attn.head_dim, str(query.device)),
+                attn.fp8_q_scale,
+                attn.fp8_k_scale,
+                attn.fp8_v_scale,
+                FP8_COMMS_DTYPE,
+            )
+            scales = Fp8CommsCall(attn.fp8_q_scale, attn.fp8_k_scale, attn.fp8_v_scale, attn.fp8_o_scale)
+            received = ulysses_aiter_fp8_attention_from_send(send, scales, self.valid_kv_len)
+            return SeqMajorFp8Output(received, attn.fp8_o_scale)
+        if seq_major == "fp8":
+            seq_major = None
         if fused_args is not None and seq_major:
             send = torch.ops.xfuser.qk_norm_rope_seq_major_send(
                 query, key, value, *fused_args, attn.heads, get_ulysses_parallel_world_size()
@@ -259,14 +315,17 @@ def _block_branches(block, projected, image_rotary_emb) -> tuple:
         return attn_output, ff_output
 
     attention_output = processor.attend_unprojected(block.attn, query, key, value, image_rotary_emb)
+    descale = None
+    if isinstance(attention_output, SeqMajorFp8Output):
+        attention_output, descale = attention_output
     if _takes_quantized_input(block.fused_out):
         if attention_output.ndim == 3:
             # [b, s, h * d] rows as a one-rank receive buffer [1, s, b, h, d].
             attention_output = attention_output.unflatten(-1, (block.attn.heads, -1)).unsqueeze(0).transpose(1, 2)
-        quantized = torch.ops.xfuser.attention_output_swiglu_mxfp4_quant(attention_output, ff_hidden)
+        quantized = torch.ops.xfuser.attention_output_swiglu_mxfp4_quant(attention_output, ff_hidden, descale)
         return (block.fused_out.forward_quantized(*quantized, ff_hidden.shape[:-1]),)
     if attention_output.ndim == 5:
-        attention_output = seq_major_attention_output(attention_output)
+        attention_output = _seq_major_rows(attention_output, descale, ff_hidden.dtype)
     return (block.fused_out(torch.cat([attention_output, block.ff.act_fn(ff_hidden)], dim=-1)),)
 
 

@@ -66,6 +66,38 @@ def test_qk_norm_rope_matches_upstream(rows, world_size, dtype):
         _assert_rounds_like(fused, reference)
 
 
+@pytest.mark.parametrize("world_size", [1, 8])
+@pytest.mark.parametrize("rows", [10, 522])
+def test_fp8_send_matches_usp_fp8_comms_quantization(rows, world_size):
+    """The FP8 send buffer is ``fp8_comms``' rotate-and-quantize of the bf16 one. Only the
+    Hadamard rotation's accumulation order differs from USP's GEMM, which rarely moves a q
+    or k value one FP8 step; v is exact."""
+    from xfuser.core.attention.numerics import hadamard
+    from xfuser.core.distributed.fp8_comms import _FP8_DTYPE, _per_tensor_quant
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v, weights, cos, sin = _qk_inputs(rows, torch.bfloat16, generator)
+    scales = [torch.tensor([value], device="cuda") for value in (0.004, 0.006, 0.02)]
+    rotation = hadamard.matrix(HEAD_DIM, "cuda")
+
+    send = torch.ops.xfuser.qk_norm_rope_seq_major_send_fp8(
+        q, k, v, *weights, EPS, cos, sin, HEADS, world_size, rotation, *scales, _FP8_DTYPE
+    )
+
+    qk = torch.ops.xfuser.qk_norm_rope(q, k, *weights, EPS, cos, sin, HEADS)
+    rotated_q, rotated_k = hadamard.rotate_qk(qk[:, :, 0], qk[:, :, 1])
+    bf16_send = _seq_major_qkv_send(rotated_q, rotated_k, v.unflatten(-1, (HEADS, -1)), world_size)
+    for which, scale in enumerate(scales):
+        fused = send[:, :, :, which].float()
+        reference = _per_tensor_quant(bf16_send[:, :, :, which], scale)[0].float()
+        if which == 2:
+            torch.testing.assert_close(fused, reference, rtol=0, atol=0)
+            continue
+        assert (fused != reference).float().mean().item() < 1e-3
+        # One e4m3 step is 2**-3 relative; the smallest subnormal step is 2**-9.
+        torch.testing.assert_close(fused, reference, rtol=2**-3, atol=2**-9)
+
+
 def _segments(lengths, dtype, generator):
     """Single-block style segments: each shares one modulation row (stride 0)."""
     segments = []

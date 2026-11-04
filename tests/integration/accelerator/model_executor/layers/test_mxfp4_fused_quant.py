@@ -60,6 +60,30 @@ def test_attention_output_quant_matches_hip_quant_bitwise(batch, seq_len):
     assert _mismatches(fused, _hip_quant(rows), *rows.shape) == (0.0, 0.0)
 
 
+@pytest.mark.parametrize("world_size", [1, 8])
+def test_fp8_attention_output_quant_dequantizes_as_fp8_comms(world_size):
+    """An FP8 receive buffer (FP8 Ulysses comms) quantizes as its ``fp8_comms`` dequantization."""
+    from xfuser.core.distributed.fp8_comms import _per_tensor_quant
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    batch, seq_len, heads = 2, 261, 24 // world_size
+    received = _activations(world_size, seq_len, batch, heads, 128, generator=generator)
+    projected = _activations(batch, seq_len, 3 * 3072 + 2 * 9216, generator=generator)
+    ff_hidden = projected[..., 3 * 3072 :]
+    fp8, descale = _per_tensor_quant(received, torch.tensor([0.37], device="cuda"))
+    dequantized = (fp8.float() * descale).to(torch.bfloat16)
+
+    for op, args, cols in (
+        (torch.ops.xfuser.seq_major_attention_output_mxfp4_quant, (), 3072),
+        (torch.ops.xfuser.attention_output_swiglu_mxfp4_quant, (ff_hidden,), 3072 + 9216),
+    ):
+        fused = op(fp8, *args, descale)
+        reference = op(dequantized, *args)
+        assert _mismatches(fused, reference, batch * seq_len, cols) == (0.0, 0.0)
+    with pytest.raises(ValueError, match="descale"):
+        torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(fp8)
+
+
 def test_quantized_gemm_matches_the_quantizing_gemm():
     generator = torch.Generator(device="cuda").manual_seed(0)
     received = _activations(8, 66, 1, 3, 128, generator=generator)

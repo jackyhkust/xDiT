@@ -193,7 +193,7 @@ def _seq_major_worker(rank, world_size, init_method, ulysses_degree):
         device = _setup(rank, world_size, init_method, ulysses_degree, backend="AITER")
         # AITER's dense kernel takes bf16 and a head dimension of at least 64.
         wrapper = _wrapper_of(_tiny_model(device, head_dim=64), device).to(torch.bfloat16)
-        assert wrapper._joint_processor._uses_seq_major_ulysses(wrapper.single_transformer_blocks[0].attn)
+        assert wrapper._joint_processor._seq_major_ulysses(wrapper.single_transformer_blocks[0].attn) == "bf16"
 
         for layout, with_references, replicate_text in itertools.product(LAYOUTS, (False, True), (True, False)):
             inputs = _inputs(device, layout, with_references)
@@ -226,6 +226,62 @@ def _seq_major_worker(rank, world_size, init_method, ulysses_degree):
 def test_seq_major_ulysses_exchange_matches_usp_with_aiter(accelerator_ranks, ulysses_degree):
     pytest.importorskip("aiter")
     accelerator_ranks(_seq_major_worker, world_size=ulysses_degree, timeout=300, args=(ulysses_degree,))
+
+
+def _seq_major_fp8_worker(rank, world_size, init_method, ulysses_degree):
+    from types import SimpleNamespace
+
+    import torch
+
+    from xfuser.core.distributed import get_runtime_state
+    from xfuser.core.distributed.fp8_comms import Fp8CommsState, resolve_fp8_comms_eligible_modules
+    from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+    from xfuser.model_executor.models.transformers.transformer_flux3 import xFuserFlux3AttnProcessor
+
+    try:
+        device = _setup(rank, world_size, init_method, ulysses_degree, backend="AITER_FP8")
+        # MHA v4 and the fused FP8 send kernel take a head dimension of 128.
+        wrapper = _wrapper_of(_tiny_model(device, head_dim=128), device).to(torch.bfloat16)
+        fp8_comms = Fp8CommsState()
+        get_runtime_state().fp8_comms = fp8_comms
+        fp8_comms.register_models(SimpleNamespace(transformer=wrapper))
+        # Distinct per-layer scales, so a layer reading another's scale shows.
+        for index, attn in enumerate(resolve_fp8_comms_eligible_modules(wrapper)):
+            for offset, name in enumerate(("fp8_q_scale", "fp8_k_scale", "fp8_v_scale", "fp8_o_scale")):
+                getattr(attn, name).fill_(0.004 * (1 + 0.1 * index + 0.03 * offset))
+        fp8_comms.get_model_state(wrapper).synced = True
+        assert wrapper._joint_processor._seq_major_ulysses(wrapper.single_transformer_blocks[0].attn) == "fp8"
+
+        for layout, with_references in itertools.product(LAYOUTS, (False, True)):
+            inputs = _inputs(device, layout, with_references)
+            for name in ("hidden_states", "encoder_hidden_states", "image_cond_hidden_states"):
+                if name in inputs:
+                    inputs[name] = inputs[name].to(torch.bfloat16)
+            outputs = {}
+            for seq_major in (True, False):
+                xFuserFlux3AttnProcessor.seq_major_ulysses = seq_major
+                with torch.no_grad():
+                    outputs[seq_major] = wrapper(**inputs).sample.float()
+            # The fused kernel's Hadamard rotation accumulates in another order than USP's
+            # GEMM, so a rare q or k element lands one FP8 step away.
+            difference = (outputs[True] - outputs[False]).abs()
+            scale = outputs[False].abs().mean()
+            context = f"Ulysses {ulysses_degree}, {layout} layout, references={with_references}"
+            assert difference.mean() <= 0.01 * scale, f"{context}: mean |diff| {difference.mean()} vs {scale}"
+            assert difference.max() <= 0.1 * outputs[False].abs().max(), f"{context}: max |diff| {difference.max()}"
+    finally:
+        xFuserFlux3AttnProcessor.seq_major_ulysses = True
+        get_runtime_state().fp8_comms = None
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+@pytest.mark.parametrize("ulysses_degree", [2, 4, 8])
+def test_fp8_seq_major_ulysses_exchange_matches_usp_fp8_comms(accelerator_ranks, ulysses_degree):
+    kernel = pytest.importorskip("xfuser.core.attention.backends.aiter_fp8.kernel")
+    if not kernel.MHA_V4_AVAILABLE:
+        pytest.skip("MHA v4 is not available")
+    accelerator_ranks(_seq_major_fp8_worker, world_size=ulysses_degree, timeout=300, args=(ulysses_degree,))
 
 
 def _cfg_worker(rank, world_size, init_method):
