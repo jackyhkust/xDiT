@@ -710,9 +710,11 @@ def test_row_split_processor_rebuilds_the_whole_attention(rank):
     sent = []
 
     def all_gather_into_tensor(bands, local, group=None):
+        # The output every backend accepts (Gloo included): the inputs concatenated along dim 0.
+        assert bands.shape == (2 * local.shape[0], *local.shape[1:])
         sent.append(local.clone())
-        bands.copy_(torch.stack(whole.chunk(2, dim=2)))
-        bands[rank] = local
+        bands.copy_(torch.cat(whole.chunk(2, dim=2)))
+        bands[rank * local.shape[0] : (rank + 1) * local.shape[0]] = local
 
     context = ParallelContext(group=None, rank=rank, world_size=2, patch_dim=-2)
     attn.set_processor(vae_manager.RowSplitAttnProcessor(context))
