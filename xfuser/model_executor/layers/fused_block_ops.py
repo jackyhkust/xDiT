@@ -424,8 +424,23 @@ def qk_norm_rope_seq_major_send_fp8(
 
 
 @qk_norm_rope_seq_major_send_fp8.register_fake
-def _(query, key, value, q_weight, k_weight, eps, cos, sin, heads, world_size, rotation, q_scale, k_scale, v_scale,
-      fp8_dtype):
+def _(
+    query,
+    key,
+    value,
+    q_weight,
+    k_weight,
+    eps,
+    cos,
+    sin,
+    heads,
+    world_size,
+    rotation,
+    q_scale,
+    k_scale,
+    v_scale,
+    fp8_dtype,
+):
     batch, seq_len, cols = query.shape
     return query.new_empty(world_size, seq_len, batch, 3, heads // world_size, cols // heads, dtype=fp8_dtype)
 
