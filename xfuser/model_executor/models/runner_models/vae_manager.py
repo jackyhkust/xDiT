@@ -108,9 +108,10 @@ class RowSplitAttnProcessor:
             return self.whole(attn, hidden_states, encoder_hidden_states, attention_mask, temb, *args, **kwargs)
         rows = hidden_states.shape[2] // world_size
         local = attention_rows(attn, hidden_states, self.parallel_context.rank * rows, rows).contiguous()
-        bands = torch.empty((world_size, *local.shape), dtype=local.dtype, device=local.device)
+        # Gloo requires the gather output concatenated along dim 0, not stacked.
+        bands = torch.empty((world_size * local.shape[0], *local.shape[1:]), dtype=local.dtype, device=local.device)
         dist.all_gather_into_tensor(bands, local, group=self.parallel_context.group)
-        return bands.permute(1, 2, 0, 3, 4).reshape(hidden_states.shape)
+        return bands.view(world_size, *local.shape).permute(1, 2, 0, 3, 4).reshape(hidden_states.shape)
 
 
 def _splittable_attention(attn) -> bool:
