@@ -75,6 +75,8 @@ def test_fp8_send_matches_usp_fp8_comms_quantization(rows, world_size):
     from xfuser.core.attention.numerics import hadamard
     from xfuser.core.distributed.fp8_comms import _FP8_DTYPE, _per_tensor_quant
 
+    if (reason := hadamard.CREATE_HADAMARD.unmet()) is not None:
+        pytest.skip(reason)
     generator = torch.Generator(device="cuda").manual_seed(0)
     q, k, v, weights, cos, sin = _qk_inputs(rows, torch.bfloat16, generator)
     scales = [torch.tensor([value], device="cuda") for value in (0.004, 0.006, 0.02)]

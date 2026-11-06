@@ -198,6 +198,19 @@ if MXFP4_FUSED_QUANT_AVAILABLE:
             y = (y * tl.load(descale_ptr)).to(tl.bfloat16).to(tl.float32)
         _store_mxfp4_row_part(y, row, start, cols, col_offset, row_cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K)
 
+else:
+    try:
+        import triton
+        import triton.language as tl
+    except ImportError:
+        pass
+    else:
+        # Triton resolves every global a kernel names, constexpr-dead branches included, so
+        # fused_block_ops' row kernel needs this name even when it never quantizes.
+        @triton.jit
+        def _store_mxfp4_row(y, row, first_col, cols, fp4_ptr, scale_ptr, scale_cols, BLOCK_K: tl.constexpr):
+            tl.static_assert(False, "MXFP4 quantization needs AITER")
+
 
 def _check_rows(name: str, tensor: torch.Tensor) -> None:
     if tensor.stride(-1) != 1:
