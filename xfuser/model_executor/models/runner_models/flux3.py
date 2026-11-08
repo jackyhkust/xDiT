@@ -140,6 +140,9 @@ class _Flux3Model(xFuserModel):
             xFuserFlux3Transformer2DWrapper,
         )
         from xfuser.model_executor.pipelines.pipeline_flux3 import prepare_flux3_pipeline
+        # AITER's tuned MXFP4 GEMM table for klein (flux3_klein_a4w4_blockscale_tuned_gemm.csv)
+        # is not loaded here. It moves to ROCm/aiter (model_configs): <aiter PR TBD>, commit <TBD>.
+        # Until it lands, AITER uses its default tile choice for these GEMMs.
 
         log(f"Loading {self.settings.model_name}")
         transformer = self.loader.load_transformer(xFuserFlux3Transformer2DWrapper)
