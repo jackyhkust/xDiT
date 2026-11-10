@@ -12,6 +12,9 @@ quantization (``aiter.get_hip_quant(per_1x32)(y, shuffle=True)``, the one inside
 - ``attention_output_swiglu_mxfp4_quant``: those attention rows and the feed-forward hidden
   state side by side, the input of a block's merged output GEMM.
 
+Where FlyDSL is available, the SwiGLU quantization (alone or as the second half of the merged
+input) runs ``swiglu_mxfp4_flydsl``'s kernel instead of the Triton one, with the same bytes.
+
 Both outputs are uint8: the values are ``[M, K / 2]`` and the scales are
 ``[ceil(M / 256) * 256, ceil(K / 256) * 8]`` in the order of ``_mx_scale_index``. The
 producers keep fp32 intermediates and round once to bf16 before quantizing, as Inductor's
@@ -21,6 +24,8 @@ fused kernels do.
 from typing import Optional, Tuple
 
 import torch
+
+from xfuser.model_executor.layers import swiglu_mxfp4_flydsl
 
 try:
     import triton
@@ -285,6 +290,13 @@ def _swiglu_rows(x: torch.Tensor) -> torch.Tensor:
 
 def _launch_swiglu(rows, fp4, quant_scale, col_offset):
     """Quantize the SwiGLU of ``[M, 2n]`` ``rows`` into columns ``col_offset`` onwards."""
+    if swiglu_mxfp4_flydsl.supported(rows, fp4, col_offset):
+        swiglu_mxfp4_flydsl.launch_swiglu_mxfp4(rows, fp4, quant_scale, col_offset)
+    else:
+        _launch_swiglu_triton(rows, fp4, quant_scale, col_offset)
+
+
+def _launch_swiglu_triton(rows, fp4, quant_scale, col_offset):
     cols = rows.shape[1] // 2
     if rows.shape[0]:
         _swiglu_mxfp4_kernel[(rows.shape[0], triton.cdiv(cols, _BLOCK_K))](
