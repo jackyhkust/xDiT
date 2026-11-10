@@ -38,6 +38,23 @@ def test_from_config_keeps_every_checkpoint_setting(flow_map):
     assert wrapper.state_dict().keys() == stock.state_dict().keys()
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "XFUSER_FLUX3_FUSED_MXFP4_QUANT",
+        "XFUSER_FLUX3_FUSED_QK_NORM_ROPE",
+        "XFUSER_FLUX3_FUSED_BLOCK_RESIDUAL",
+        "XFUSER_FLUX3_SEQ_MAJOR_ULYSSES",
+    ],
+)
+def test_environment_switches_each_fusion_off(monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    assert transformer_flux3._env_flag(name)
+    for value, enabled in [("1", True), (" on ", True), ("0", False), ("false", False), ("OFF", False)]:
+        monkeypatch.setenv(name, value)
+        assert transformer_flux3._env_flag(name) is enabled
+
+
 def test_each_transformer_call_advances_the_step_schedule(monkeypatch):
     # The hybrid GEMM schedule switches precision per step from this counter.
     calls = []
