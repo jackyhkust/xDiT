@@ -148,13 +148,16 @@ class xFuserMXFP4Linear(nn.Module):
 
         The per-1x32 weight quantization and the 16x16 preshuffle are local to each
         weight row block, so the packed weights and scales of layers with the same
-        input can be stacked along N without requantizing.
+        input can be stacked along N without requantizing. The quantization pads each
+        scale to a multiple of 256 rows, so only the last layer's scale may be padded.
         """
         in_features = layers[0].in_features
         if any(layer.in_features != in_features or layer.bias is not None for layer in layers):
             raise ValueError("Only bias-free MXFP4 layers with the same input width can be concatenated.")
         if any(not hasattr(layer, "weight_shuffle") for layer in layers):
             raise ValueError("Quantize the MXFP4 layers before concatenating them.")
+        if any(layer.weight_scale.shape[0] != layer.out_features for layer in layers[:-1]):
+            raise ValueError("Only the last concatenated MXFP4 layer may have padded scale rows.")
         fused = cls.__new__(cls)
         nn.Module.__init__(fused)
         fused.in_features = in_features

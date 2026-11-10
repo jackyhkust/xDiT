@@ -197,6 +197,22 @@ def test_concatenated_refuses_unquantized_or_biased_layers(runtime, fake_aiter_q
         runtime.module.xFuserMXFP4Linear.concatenated([biased])
 
 
+def test_concatenated_refuses_padded_scales_before_the_last_layer(runtime, fake_aiter_quantization):
+    torch = runtime.torch
+    layers = [runtime.module.xFuserMXFP4Linear(8, 128, bias=False) for _ in range(2)]
+    for layer in layers:
+        layer._quantize_weights()
+        # AITER's shuffled scale has a multiple of 256 rows.
+        layer.weight_scale = torch.ones((256, 1), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="padded scale rows"):
+        runtime.module.xFuserMXFP4Linear.concatenated(layers)
+
+    layers[0].weight_scale = torch.ones((128, 1), dtype=torch.uint8)
+    fused = runtime.module.xFuserMXFP4Linear.concatenated(layers)
+    assert fused.weight_scale.shape == (384, 1)
+
+
 @pytest.mark.accelerator
 def test_concatenated_matches_quantizing_the_stacked_weight():
     # The packing and scale preshuffle must be local to row blocks for stacking to be exact.

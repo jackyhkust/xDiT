@@ -419,9 +419,12 @@ _FUSED_BLOCK_CLASSES = {
 
 def _concatenated_linear(layers) -> Optional[torch.nn.Module]:
     """One layer equal to the given layers' outputs concatenated, or None if their kind
-    cannot be stacked (FP8 tensor subclasses, the hybrid FP4 layer, bias)."""
+    cannot be stacked (FP8 tensor subclasses, the hybrid FP4 layer, bias, padded MXFP4 scales)."""
     if all(type(layer) is xFuserMXFP4Linear for layer in layers):
-        return xFuserMXFP4Linear.concatenated(layers)
+        try:
+            return xFuserMXFP4Linear.concatenated(layers)
+        except ValueError:
+            return None
     plain = all(
         type(layer) is torch.nn.Linear and layer.bias is None and type(layer.weight.data) is torch.Tensor
         for layer in layers
