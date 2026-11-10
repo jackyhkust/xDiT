@@ -85,6 +85,7 @@ class _Flux3Model(xFuserModel):
         enable_tiling=True,
         enable_slicing=True,
         use_parallel_vae=True,
+        split_parallel_vae_attention=True,
         vae_dtype=True,
     )
     # Shared by both checkpoints, which add their model and output names with replace().

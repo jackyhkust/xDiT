@@ -5,6 +5,7 @@ cover only the xDiT policy that discovers VAEs, selects its runtime group, forwa
 and presents decode failures.
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest import mock
 
@@ -346,6 +347,29 @@ def test_parallel_setup_adapts_runtime_group_for_distvae():
         mock.call(tiled, device_group),
         mock.call(sharded, device_group),
     ]
+
+
+@pytest.mark.parametrize("split_attention", [False, True])
+def test_only_models_that_opt_in_split_the_parallel_decoders_attention(split_attention):
+    vae = SimpleNamespace()
+    coordinator = SimpleNamespace(device_group=object(), rank_in_group=0, world_size=2, ranks=[0, 1])
+    runner = _runner(use_parallel_vae=True)
+    runner.capabilities = dataclasses.replace(
+        runner.capabilities, use_parallel_vae_encoder=False, split_parallel_vae_attention=split_attention
+    )
+    runner._vae_manager = vae_manager.VAEManager(runner.config, runner.capabilities, runner.settings)
+
+    with (
+        mock.patch.object(vae_manager, "get_vae_parallel_group", return_value=coordinator),
+        mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+        mock.patch.object(torch.distributed, "get_rank", return_value=0),
+        mock.patch.object(vae_manager.vae_tiling, "supports_tile_parallel", return_value=False),
+        mock.patch.object(vae_manager.vae_parallel, "parallelize_decoder", return_value="DecoderAdapter"),
+        mock.patch.object(vae_manager, "split_replicated_vae_attention", return_value=1) as split,
+    ):
+        runner._vae_manager.setup_parallel_vae([vae])
+
+    assert split.called == split_attention
 
 
 def test_tile_overlap_is_applied_through_distvae():
