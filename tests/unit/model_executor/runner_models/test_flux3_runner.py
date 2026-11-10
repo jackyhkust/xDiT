@@ -107,6 +107,13 @@ def test_compile_warmup_runs_a_whole_schedule(
     assert model._get_compile_warmup_steps(_args()) == warmup_steps
 
 
+def test_the_compiled_text_encoder_keeps_leaf_level_offload(build_flux3):
+    model = build_flux3()
+
+    assert "text_encoder" in model._get_compiled_pipe_components()
+    assert model._get_block_offload_components() == ["transformer"]
+
+
 def test_negative_prompt_is_refused(build_flux3):
     model = build_flux3()
 

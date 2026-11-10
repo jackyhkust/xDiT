@@ -210,6 +210,11 @@ class _Flux3Model(xFuserModel):
         # decoder layers compile blockwise (fsdp_strategy wrap_attrs) like the transformer.
         return ["transformer", "text_encoder"]
 
+    def _get_block_offload_components(self) -> list[str]:
+        # The text encoder's decoder layers nest at model.language_model.layers, out of reach
+        # of block-level grouping, which would offload the whole encoder as one group.
+        return ["transformer"]
+
     def _get_compile_mode(self) -> str:
         # A sharded forward is launch-bound: graphs cut a compiled u8 1024² forward on
         # MI350X from 22 to 17 ms. Graphs re-capture pathologically on RDNA4, as for FLUX.2.
