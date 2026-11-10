@@ -14,6 +14,7 @@ from diffusers.models.transformers.transformer_flux3 import (
     _get_qkv_projections,
 )
 
+from xfuser import envs
 from xfuser.core.attention.numerics import hadamard
 from xfuser.core.attention.spec import AttentionBackendType
 from xfuser.core.distributed import (
@@ -44,14 +45,18 @@ from xfuser.model_executor.models.transformers.transformers_utils import (
 )
 
 
+def _env_flag(name: str) -> bool:
+    return getattr(envs, name).strip().lower() not in ("0", "false", "off")
+
+
 # The FP4 GEMM inputs are quantized by the kernels producing them (see mxfp4_fused_quant).
-FUSED_MXFP4_QUANT = True
+FUSED_MXFP4_QUANT = _env_flag("XFUSER_FLUX3_FUSED_MXFP4_QUANT")
 
 
 # q/k RMSNorm and RoPE run in one kernel that also packs the Ulysses send buffer, and each
 # block's gated residual runs in the next block's LayerNorm kernel (see fused_block_ops).
-FUSED_QK_NORM_ROPE = True
-FUSED_BLOCK_RESIDUAL = True
+FUSED_QK_NORM_ROPE = _env_flag("XFUSER_FLUX3_FUSED_QK_NORM_ROPE")
+FUSED_BLOCK_RESIDUAL = _env_flag("XFUSER_FLUX3_FUSED_BLOCK_RESIDUAL")
 
 
 class SeqMajorFp8Output(NamedTuple):
@@ -109,7 +114,7 @@ class xFuserFlux3AttnProcessor:
     """
 
     # Ulysses-only AITER attention takes the sequence-major exchange (see ulysses_aiter_attention).
-    seq_major_ulysses = True
+    seq_major_ulysses = _env_flag("XFUSER_FLUX3_SEQ_MAJOR_ULYSSES")
 
     def __init__(self):
         self.valid_kv_len: Optional[int] = None

@@ -163,8 +163,19 @@ class _Flux3Model(xFuserModel):
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
         super()._post_load_and_state_initialization(input_args)
+        self._check_fused_mxfp4_quant()
         self._fuse_block_input_projections()
         self._expose_transformer_signature()
+
+    def _check_fused_mxfp4_quant(self) -> None:
+        from xfuser.model_executor.layers import mxfp4_fused_quant
+
+        if self.config.use_fp4_gemms and not mxfp4_fused_quant.MXFP4_FUSED_QUANT_AVAILABLE:
+            log(
+                "WARNING: FLUX.3 MXFP4 GEMMs run without the fused input quantization: the AITER build "
+                "lacks aiter.ops.triton._triton_kernels.quant.quant._mxfp4_pack_op, so each GEMM "
+                "input is quantized separately (slower, same result)."
+            )
 
     def _fuse_block_input_projections(self) -> None:
         # After the loader's FP8/FP4 swaps, which decide what can be stacked, and before
@@ -286,17 +297,23 @@ class _Flux3Model(xFuserModel):
             pipe_kwargs["max_sequence_length"] = input_args["max_sequence_length"]
 
         images, args_per_image = [], []
-        for prompt in prompts:
-            # The pipeline draws the noise in fp32 from a CPU generator, as in the model
-            # card, so a seed gives the same image as the documented diffusers usage.
-            image = self.pipe(
-                prompt=prompt,
-                generator=torch.Generator().manual_seed(input_args["seed"]),
-                **pipe_kwargs,
-            )[0]
-            images.append(image)
-            # Edits size the output from the reference unless told otherwise.
-            args_per_image.append({**input_args, "prompt": prompt, "height": image.height, "width": image.width})
+        try:
+            for prompt in prompts:
+                # The pipeline draws the noise in fp32 from a CPU generator, as in the model
+                # card, so a seed gives the same image as the documented diffusers usage.
+                image = self.pipe(
+                    prompt=prompt,
+                    generator=torch.Generator().manual_seed(input_args["seed"]),
+                    **pipe_kwargs,
+                )[0]
+                images.append(image)
+                # Edits size the output from the reference unless told otherwise.
+                args_per_image.append({**input_args, "prompt": prompt, "height": image.height, "width": image.width})
+        finally:
+            # The per-call cache holds the prompt embeddings and ids it was computed from.
+            step_constants = getattr(getattr(self.pipe, "transformer", None), "_step_constants", None)
+            if step_constants is not None:
+                step_constants.clear()
         return DiffusionOutput(images=images, pipe_args=args_per_image)
 
 

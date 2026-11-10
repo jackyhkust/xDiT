@@ -30,7 +30,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # used in distributed environment to determine the master address
     "MASTER_ADDR": lambda: os.getenv("MASTER_ADDR", ""),
     # used in distributed environment to manually set the communication port
-    "MASTER_PORT": lambda: (int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None),
+    "MASTER_PORT": lambda: int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None,
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
     "CUDA_HOME": lambda: os.environ.get("CUDA_HOME", None),
@@ -58,6 +58,13 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     #       quantise and broadcast work, at the cost of a second shard resident.
     # These are reclaimable file-backed pages that the fill drops as it finishes each shard.
     "XDIT_WARM_SHARDS": lambda: os.environ.get("XDIT_WARM_SHARDS", "2"),
+    # FLUX.3's fused kernels and sequence-major Ulysses exchange, each on by default; 0, false
+    # or off selects the unfused path, for A/B runs and bisects. Read when the transformer
+    # module is imported.
+    "XFUSER_FLUX3_FUSED_MXFP4_QUANT": lambda: os.environ.get("XFUSER_FLUX3_FUSED_MXFP4_QUANT", "1"),
+    "XFUSER_FLUX3_FUSED_QK_NORM_ROPE": lambda: os.environ.get("XFUSER_FLUX3_FUSED_QK_NORM_ROPE", "1"),
+    "XFUSER_FLUX3_FUSED_BLOCK_RESIDUAL": lambda: os.environ.get("XFUSER_FLUX3_FUSED_BLOCK_RESIDUAL", "1"),
+    "XFUSER_FLUX3_SEQ_MAJOR_ULYSSES": lambda: os.environ.get("XFUSER_FLUX3_SEQ_MAJOR_ULYSSES", "1"),
 }
 
 

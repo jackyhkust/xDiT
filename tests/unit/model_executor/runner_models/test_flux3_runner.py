@@ -198,6 +198,33 @@ def test_a_seed_draws_the_same_noise_as_a_cpu_generator(build_flux3):
     assert torch.equal(torch.randn(4, generator=generator), torch.randn(4, generator=torch.Generator().manual_seed(7)))
 
 
+def test_a_call_releases_the_transformers_step_constants(build_flux3):
+    model = build_flux3()
+    model.pipe = _RecordingPipe((1024, 1024))
+    model.pipe.transformer = SimpleNamespace(_step_constants={"context": (torch.zeros(1), 0, torch.zeros(1))})
+
+    model._run_pipe(_args())
+
+    assert model.pipe.transformer._step_constants == {}
+
+
+@pytest.mark.parametrize(
+    ("use_fp4_gemms", "available", "warned"), [(True, False, True), (True, True, False), (False, False, False)]
+)
+def test_fp4_without_the_fused_quant_is_reported(build_flux3, monkeypatch, use_fp4_gemms, available, warned):
+    from xfuser.model_executor.layers import mxfp4_fused_quant
+
+    model = build_flux3()
+    model.config.use_fp4_gemms = use_fp4_gemms
+    monkeypatch.setattr(mxfp4_fused_quant, "MXFP4_FUSED_QUANT_AVAILABLE", available)
+    messages = []
+    monkeypatch.setattr("xfuser.model_executor.models.runner_models.flux3.log", messages.append)
+
+    model._check_fused_mxfp4_quant()
+
+    assert any("without the fused input quantization" in m for m in messages) == warned
+
+
 def test_the_base_model_runs_the_requested_guidance_and_negative_prompt(build_flux3):
     model = build_flux3("FLUX.3-image-klein-base")
     pipe = _RecordingPipe((1024, 1024))
