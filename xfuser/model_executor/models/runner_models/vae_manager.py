@@ -258,7 +258,7 @@ class VAEManager:
             else:
                 adapter = vae_parallel.parallelize_decoder(vae, vae_group)
                 log(f"Parallel VAE decoder enabled on {type(vae).__name__} via {adapter}.")
-                split = split_replicated_vae_attention(vae)
+                split = split_replicated_vae_attention(vae) if self.capabilities.split_parallel_vae_attention else 0
                 if split:
                     log(f"Parallel VAE decoder: {split} replicated mid-block attention(s) split by query rows.")
             if self.capabilities.use_parallel_vae_encoder:
