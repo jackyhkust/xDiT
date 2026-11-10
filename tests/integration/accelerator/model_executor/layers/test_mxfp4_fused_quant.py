@@ -2,8 +2,8 @@
 
 The attention-output op only reorders, so its bytes must match the HIP quantization of the
 reordered rows. The SwiGLU and LayerNorm producers compute their bf16 result with Triton
-math, whose last fp32 bit can differ from torch's and so, rarely, its bf16 rounding; their
-quantization of that result must still match the HIP one.
+(or, for SwiGLU, FlyDSL) math, whose last fp32 bit can differ from torch's and so, rarely,
+its bf16 rounding; their quantization of that result must still match the HIP one.
 """
 
 import pytest
@@ -110,6 +110,27 @@ def test_swiglu_quant_matches_hip_quant_of_swiglu(rows):
 
     fp4_diff, scale_diff = _mismatches(fused, reference, rows, hidden)
     assert fp4_diff < 1e-4 and scale_diff < 1e-3
+
+
+@pytest.mark.parametrize("col_offset", [0, 3072])
+@pytest.mark.parametrize("rows", [80, 522, 2058])
+def test_flydsl_swiglu_quant_matches_triton_bitwise(rows, col_offset):
+    from xfuser.model_executor.layers import swiglu_mxfp4_flydsl
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    hidden = 9216
+    projected = _activations(rows, 3 * 3072 + 2 * hidden, generator=generator)
+    x = projected[:, 3 * 3072 :]
+    flydsl, triton = (mxfp4_fused_quant.mxfp4_buffers(rows, col_offset + hidden, x.device) for _ in range(2))
+    if not swiglu_mxfp4_flydsl.supported(x, flydsl[0], col_offset):
+        pytest.skip("FlyDSL is unavailable.")
+
+    swiglu_mxfp4_flydsl.launch_swiglu_mxfp4(x, *flydsl, col_offset)
+    mxfp4_fused_quant._launch_swiglu_triton(x, *triton, col_offset)
+
+    assert torch.equal(flydsl[0][:, col_offset // 2 :], triton[0][:, col_offset // 2 :])
+    positions = _scale_positions(rows, col_offset + hidden, flydsl[1].shape[1], x.device)[:, col_offset // 32 :]
+    assert torch.equal(flydsl[1].flatten()[positions], triton[1].flatten()[positions])
 
 
 @pytest.mark.parametrize("world_size", [1, 8])
