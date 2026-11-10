@@ -80,12 +80,31 @@ def test_cfg_parallel_without_guidance_is_refused(build_flux3):
         ("FLUX.3-image-klein-base", {}, 3.5, 2),
         ("FLUX.3-image-klein-base", {"use_cfg_parallel": True}, 3.5, 1),
         ("FLUX.3-image-klein-base", {}, 1.0, 1),
+        # The guider keeps both branches at any scale other than 1.
+        ("FLUX.3-image-klein-base", {}, 0.5, 2),
     ],
 )
 def test_hybrid_schedules_count_every_transformer_call(build_flux3, name, config, guidance_scale, calls_per_step):
     model = build_flux3(name, **config)
 
     assert model._calculate_hybrid_attention_step_multiplier(_args(guidance_scale=guidance_scale)) == calls_per_step
+
+
+@pytest.mark.parametrize(
+    ("attention_schedule", "gemm_schedule", "warmup_steps"),
+    [(False, False, 2), (False, True, None), (True, False, None)],
+)
+def test_compile_warmup_runs_a_whole_schedule(
+    build_flux3, monkeypatch, attention_schedule, gemm_schedule, warmup_steps
+):
+    model = build_flux3()
+    state = SimpleNamespace(
+        has_attention_schedule=lambda: attention_schedule,
+        has_gemm_schedule=lambda: gemm_schedule,
+    )
+    monkeypatch.setattr("xfuser.model_executor.models.runner_models.flux3.get_runtime_state", lambda: state)
+
+    assert model._get_compile_warmup_steps(_args()) == warmup_steps
 
 
 def test_negative_prompt_is_refused(build_flux3):

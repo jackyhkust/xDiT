@@ -2,10 +2,12 @@ import functools
 import math
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 
 from xfuser.config.args import xFuserArgs
+from xfuser.core.distributed.runtime_state import get_runtime_state
 from xfuser.core.utils.runner_utils import log, resize_and_crop_image
 from xfuser.envs import PACKAGES_CHECKER
 from xfuser.model_executor.models.runner_models.base_model import (
@@ -215,6 +217,14 @@ class _Flux3Model(xFuserModel):
             return "default"
         return "reduce-overhead"
 
+    def _get_compile_warmup_steps(self, input_args: dict) -> Optional[int]:
+        # A per-step schedule's counter resets only after its last step, so a shortened
+        # warmup would start every later call partway through the schedule.
+        runtime_state = get_runtime_state()
+        if runtime_state.has_attention_schedule() or runtime_state.has_gemm_schedule():
+            return None
+        return 2
+
     def _get_runtime_state_pipeline(self):
         # The transformer takes tokens the pipeline already packed 2x2, so it has no
         # patch_size; runtime state reads one, and the 16-pixel token grid.
@@ -330,8 +340,10 @@ class xFuserFlux3KleinBaseModel(_Flux3Model):
     )
 
     def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
-        # Without CFG parallel the guider calls the transformer once per branch.
-        if input_args["guidance_scale"] > 1.0 and not self.config.use_cfg_parallel:
+        # Without CFG parallel the guider calls the transformer once per branch; it turns
+        # guidance off only at a scale of 1 (math.isclose).
+        guidance_scale = input_args["guidance_scale"]
+        if guidance_scale is not None and not math.isclose(guidance_scale, 1.0) and not self.config.use_cfg_parallel:
             return 2
         return 1
 
