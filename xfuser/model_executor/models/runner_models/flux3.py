@@ -173,9 +173,9 @@ class _Flux3Model(xFuserModel):
 
         if self.config.use_fp4_gemms and not mxfp4_fused_quant.MXFP4_FUSED_QUANT_AVAILABLE:
             log(
-                "WARNING: FLUX.3 MXFP4 GEMMs run without the fused input quantization: the AITER build "
-                "lacks aiter.ops.triton._triton_kernels.quant.quant._mxfp4_pack_op, so each GEMM "
-                "input is quantized separately (slower, same result)."
+                "WARNING: FLUX.3 MXFP4 GEMMs run without the fused input quantization: FlyDSL or "
+                "AITER's FlyDSL MX helpers are unavailable, so each GEMM input is quantized "
+                "separately (slower, same result)."
             )
 
     def _fuse_block_input_projections(self) -> None:

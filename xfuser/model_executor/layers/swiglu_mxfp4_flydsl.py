@@ -10,9 +10,9 @@ MX helpers. Differences from that kernel:
   ``out_cols`` columns, so the SwiGLU can fill part of a wider GEMM input;
 - the activation is rounded to bf16 before quantizing, and the block amax is floored at
   1e-10, so the result matches ``aiter.get_hip_quant(per_1x32)(y, shuffle=True)`` of the
-  bf16 SwiGLU ``y``, as ``mxfp4_fused_quant.swiglu_mxfp4_quant`` does.
+  bf16 SwiGLU ``y``.
 
-The scale layout is the HIP quantization's shuffled one (``mxfp4_fused_quant._mx_scale_index``).
+The scale layout is the HIP quantization's shuffled one.
 """
 
 # NOTE: no ``from __future__ import annotations``: flydsl detects runtime Int32 kernel

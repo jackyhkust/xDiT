@@ -16,263 +16,20 @@ op, a collective or a separately compiled block.
   ``(1 + scale) * layer_norm(.) + shift`` of the result, the next block's input, in bf16
   or quantized as ``mxfp4_fused_quant.layernorm_modulate_mxfp4_quant`` quantizes it.
 
-The math follows upstream: q/k norm and RoPE in fp32 with one rounding to the output
-dtype; the residual rounds once to the hidden-state dtype, which the LayerNorm then reads,
-and the modulated norm rounds once more.
+The kernels are ``flux3_block_flydsl``'s; inputs they do not take (fp32 activations,
+unaligned rows) run the same math in torch. The math follows upstream: q/k norm and RoPE in
+fp32 with one rounding to the output dtype; the residual rounds once to the hidden-state
+dtype, which the LayerNorm then reads, and the modulated norm rounds once more.
 """
 
 from typing import List, Tuple
 
 import torch
+import torch.nn.functional as F
 
-from xfuser.model_executor.layers import mxfp4_fused_quant
+from xfuser.model_executor.layers import flux3_block_flydsl, mxfp4_fused_quant
 
-try:
-    import triton
-    import triton.language as tl
-
-    FUSED_BLOCK_OPS_AVAILABLE = True
-except ImportError:
-    FUSED_BLOCK_OPS_AVAILABLE = False
-
-# Heads per program and warps of the q/k kernel, and warps of the row kernels: the fastest
-# at FLUX.3's shapes on MI355X (24 heads of 128, rows of 3072).
-_QK_HEADS_PER_PROGRAM = 8
-_QK_NUM_WARPS = 2
-_ROW_NUM_WARPS = 4
-# The FP8 q/k kernel's rotation is a tl.dot, whose rows (heads) must number at least 16.
-_QK_FP8_HEADS_PER_PROGRAM = 16
-_QK_FP8_NUM_WARPS = 4
-
-
-if FUSED_BLOCK_OPS_AVAILABLE:
-
-    @triton.jit
-    def _rms_norm_rope(x, weight, cos, sin, eps, HEADS: tl.constexpr, HEAD_DIM: tl.constexpr):
-        """RMSNorm over the last dimension of fp32 ``x`` ``[HEADS, HEAD_DIM]``, then RoPE on
-        interleaved pairs: ``(x0, x1)`` rotates by ``(-x1, x0)``."""
-        rstd = tl.rsqrt(tl.sum(x * x, axis=1) / HEAD_DIM + eps)
-        y = x * rstd[:, None] * weight
-        even, odd = tl.split(tl.reshape(y, [HEADS, HEAD_DIM // 2, 2]))
-        rotated = tl.reshape(tl.join(-odd, even), [HEADS, HEAD_DIM])
-        return y * cos + rotated * sin
-
-    @triton.jit
-    def _qk_norm_rope_kernel(
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        q_weight_ptr,
-        k_weight_ptr,
-        cos_ptr,
-        sin_ptr,
-        out_ptr,
-        seq_len,
-        heads,
-        heads_per_rank,
-        eps,
-        in_stride_b,
-        in_stride_s,
-        rope_stride_s,
-        out_stride_rank,
-        out_stride_s,
-        out_stride_b,
-        out_stride_which,
-        WRITE_V: tl.constexpr,
-        HEADS: tl.constexpr,
-        HEAD_DIM: tl.constexpr,
-    ):
-        index = tl.program_id(0)
-        b = index // seq_len
-        s = index % seq_len
-        head = tl.program_id(1) * HEADS + tl.arange(0, HEADS)[:, None]
-        dim = tl.arange(0, HEAD_DIM)[None, :]
-        mask = head < heads
-        in_offsets = b.to(tl.int64) * in_stride_b + s.to(tl.int64) * in_stride_s + head * HEAD_DIM + dim
-        out_offsets = (
-            (head // heads_per_rank).to(tl.int64) * out_stride_rank
-            + s.to(tl.int64) * out_stride_s
-            + b.to(tl.int64) * out_stride_b
-            + (head % heads_per_rank) * HEAD_DIM
-            + dim
-        )
-        out_dtype = out_ptr.dtype.element_ty
-        cos = tl.load(cos_ptr + s.to(tl.int64) * rope_stride_s + dim).to(tl.float32)
-        sin = tl.load(sin_ptr + s.to(tl.int64) * rope_stride_s + dim).to(tl.float32)
-
-        q = tl.load(q_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
-        q = _rms_norm_rope(q, tl.load(q_weight_ptr + dim).to(tl.float32), cos, sin, eps, HEADS, HEAD_DIM)
-        tl.store(out_ptr + out_offsets, q.to(out_dtype), mask=mask)
-        k = tl.load(k_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
-        k = _rms_norm_rope(k, tl.load(k_weight_ptr + dim).to(tl.float32), cos, sin, eps, HEADS, HEAD_DIM)
-        tl.store(out_ptr + out_stride_which + out_offsets, k.to(out_dtype), mask=mask)
-        if WRITE_V:
-            v = tl.load(v_ptr + in_offsets, mask=mask, other=0.0)
-            tl.store(out_ptr + 2 * out_stride_which + out_offsets, v.to(out_dtype), mask=mask)
-
-    @triton.jit
-    def _fp8_per_tensor(x, scale_ptr, fp8_max):
-        """``(x / scale).clamp(-fp8_max, fp8_max)`` in fp32, as ``fp8_comms._per_tensor_quant``."""
-        return tl.clamp(tl.div_rn(x, tl.load(scale_ptr)), -fp8_max, fp8_max)
-
-    @triton.jit
-    def _qk_norm_rope_fp8_send_kernel(
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        q_weight_ptr,
-        k_weight_ptr,
-        cos_ptr,
-        sin_ptr,
-        rotation_ptr,
-        q_scale_ptr,
-        k_scale_ptr,
-        v_scale_ptr,
-        out_ptr,
-        seq_len,
-        heads,
-        heads_per_rank,
-        eps,
-        fp8_max,
-        in_stride_b,
-        in_stride_s,
-        rope_stride_s,
-        out_stride_rank,
-        out_stride_s,
-        out_stride_b,
-        out_stride_which,
-        HEADS: tl.constexpr,
-        HEAD_DIM: tl.constexpr,
-    ):
-        """``_qk_norm_rope_kernel``'s sequence-major send buffer in FP8: q and k rounded to
-        bf16 after the norm and RoPE, rotated by the bf16 ``[d, d]`` Hadamard matrix and rounded
-        again (``hadamard.rotate_qk``), then q, k and v quantized with their per-tensor scales."""
-        index = tl.program_id(0)
-        b = index // seq_len
-        s = index % seq_len
-        head = tl.program_id(1) * HEADS + tl.arange(0, HEADS)[:, None]
-        dim = tl.arange(0, HEAD_DIM)[None, :]
-        mask = head < heads
-        in_offsets = b.to(tl.int64) * in_stride_b + s.to(tl.int64) * in_stride_s + head * HEAD_DIM + dim
-        out_offsets = (
-            (head // heads_per_rank).to(tl.int64) * out_stride_rank
-            + s.to(tl.int64) * out_stride_s
-            + b.to(tl.int64) * out_stride_b
-            + (head % heads_per_rank) * HEAD_DIM
-            + dim
-        )
-        out_dtype = out_ptr.dtype.element_ty
-        cos = tl.load(cos_ptr + s.to(tl.int64) * rope_stride_s + dim).to(tl.float32)
-        sin = tl.load(sin_ptr + s.to(tl.int64) * rope_stride_s + dim).to(tl.float32)
-        rotation = tl.load(rotation_ptr + tl.arange(0, HEAD_DIM)[:, None] * HEAD_DIM + dim)
-
-        q = tl.load(q_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
-        q = _rms_norm_rope(q, tl.load(q_weight_ptr + dim).to(tl.float32), cos, sin, eps, HEADS, HEAD_DIM)
-        q = tl.dot(q.to(tl.bfloat16), rotation).to(tl.bfloat16).to(tl.float32)
-        tl.store(out_ptr + out_offsets, _fp8_per_tensor(q, q_scale_ptr, fp8_max).to(out_dtype), mask=mask)
-        k = tl.load(k_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
-        k = _rms_norm_rope(k, tl.load(k_weight_ptr + dim).to(tl.float32), cos, sin, eps, HEADS, HEAD_DIM)
-        k = tl.dot(k.to(tl.bfloat16), rotation).to(tl.bfloat16).to(tl.float32)
-        tl.store(
-            out_ptr + out_stride_which + out_offsets, _fp8_per_tensor(k, k_scale_ptr, fp8_max).to(out_dtype), mask=mask
-        )
-        v = tl.load(v_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
-        tl.store(
-            out_ptr + 2 * out_stride_which + out_offsets,
-            _fp8_per_tensor(v, v_scale_ptr, fp8_max).to(out_dtype),
-            mask=mask,
-        )
-
-    @triton.jit
-    def _segment_row(ptr, stride_b, stride_s, b, s):
-        return ptr + b.to(tl.int64) * stride_b + s.to(tl.int64) * stride_s
-
-    @triton.jit
-    def _gated_residual_layernorm_modulate_kernel(
-        x0_ptr,
-        gate0_ptr,
-        shift0_ptr,
-        mod_scale0_ptr,
-        x1_ptr,
-        gate1_ptr,
-        shift1_ptr,
-        mod_scale1_ptr,
-        branch0_ptr,
-        branch1_ptr,
-        hidden_ptr,
-        out_ptr,
-        fp4_ptr,
-        scale_ptr,
-        seq_len0,
-        rows_per_batch,
-        cols,
-        eps,
-        x0_stride_b,
-        x0_stride_s,
-        gate0_stride_b,
-        gate0_stride_s,
-        shift0_stride_b,
-        shift0_stride_s,
-        mod_scale0_stride_b,
-        mod_scale0_stride_s,
-        x1_stride_b,
-        x1_stride_s,
-        gate1_stride_b,
-        gate1_stride_s,
-        shift1_stride_b,
-        shift1_stride_s,
-        mod_scale1_stride_b,
-        mod_scale1_stride_s,
-        branch0_stride_b,
-        branch0_stride_s,
-        branch1_stride_b,
-        branch1_stride_s,
-        scale_cols,
-        TWO_BRANCHES: tl.constexpr,
-        QUANTIZE: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        """One program per row of the joint ``[b, rows_per_batch]`` sequence: its first
-        ``seq_len0`` rows come from segment 0, the rest from segment 1."""
-        row = tl.program_id(0)
-        b = row // rows_per_batch
-        joint_s = row % rows_per_batch
-        if joint_s < seq_len0:
-            x_row = _segment_row(x0_ptr, x0_stride_b, x0_stride_s, b, joint_s)
-            gate_row = _segment_row(gate0_ptr, gate0_stride_b, gate0_stride_s, b, joint_s)
-            shift_row = _segment_row(shift0_ptr, shift0_stride_b, shift0_stride_s, b, joint_s)
-            mod_scale_row = _segment_row(mod_scale0_ptr, mod_scale0_stride_b, mod_scale0_stride_s, b, joint_s)
-        else:
-            s = joint_s - seq_len0
-            x_row = _segment_row(x1_ptr, x1_stride_b, x1_stride_s, b, s)
-            gate_row = _segment_row(gate1_ptr, gate1_stride_b, gate1_stride_s, b, s)
-            shift_row = _segment_row(shift1_ptr, shift1_stride_b, shift1_stride_s, b, s)
-            mod_scale_row = _segment_row(mod_scale1_ptr, mod_scale1_stride_b, mod_scale1_stride_s, b, s)
-        col = tl.arange(0, BLOCK)
-        mask = col < cols
-
-        x = tl.load(x_row + col, mask=mask, other=0.0).to(tl.float32)
-        gate = tl.load(gate_row + col, mask=mask, other=0.0).to(tl.float32)
-        branch0_row = _segment_row(branch0_ptr, branch0_stride_b, branch0_stride_s, b, joint_s)
-        branch = tl.load(branch0_row + col, mask=mask, other=0.0).to(tl.float32)
-        if TWO_BRANCHES:
-            branch1_row = _segment_row(branch1_ptr, branch1_stride_b, branch1_stride_s, b, joint_s)
-            branch += tl.load(branch1_row + col, mask=mask, other=0.0).to(tl.float32)
-        hidden = (x + gate * branch).to(hidden_ptr.dtype.element_ty)
-        tl.store(hidden_ptr + row.to(tl.int64) * cols + col, hidden, mask=mask)
-
-        hidden = hidden.to(tl.float32)
-        mean = tl.sum(hidden, axis=0) / cols
-        centered = tl.where(mask, hidden - mean, 0.0)
-        rstd = tl.rsqrt(tl.sum(centered * centered, axis=0) / cols + eps)
-        shift = tl.load(shift_row + col, mask=mask, other=0.0).to(tl.float32)
-        mod_scale = tl.load(mod_scale_row + col, mask=mask, other=0.0).to(tl.float32)
-        y = (1.0 + mod_scale) * (centered * rstd) + shift
-        if QUANTIZE:
-            y = tl.where(mask, y.to(tl.bfloat16).to(tl.float32), 0.0)
-            mxfp4_fused_quant._store_mxfp4_row(y, row, 0, cols, fp4_ptr, scale_ptr, scale_cols, BLOCK)
-        else:
-            tl.store(out_ptr + row.to(tl.int64) * cols + col, y.to(out_ptr.dtype.element_ty), mask=mask)
+FUSED_BLOCK_OPS_AVAILABLE = flux3_block_flydsl.HAS_FLYDSL
 
 
 def _check_qk_inputs(query, key, value, q_weight, k_weight, cos, sin, heads):
@@ -292,40 +49,38 @@ def _check_qk_inputs(query, key, value, q_weight, k_weight, cos, sin, heads):
     return head_dim
 
 
-def _launch_qk_norm_rope(query, key, value, q_weight, k_weight, eps, cos, sin, heads, out, seq_major):
-    """Run the q/k kernel on ``[b, s, h * d]`` q, k, v into ``out``: the send buffer
-    ``[P, s, b, 3, h/P, d]`` if ``seq_major``, else ``[b, s, 2, h, d]`` q and k."""
-    batch, seq_len, _ = query.shape
+def _norm_rope(x, weight, eps, cos, sin, heads):
+    """Upstream's fp32 RMSNorm and interleaved RoPE of ``[b, s, h * d]`` ``x``, ``[b, s, h, d]``."""
+    x = x.float().unflatten(-1, (heads, -1))
+    y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight.float()
+    rotated = torch.stack([-y[..., 1::2], y[..., 0::2]], dim=-1).flatten(-2)
+    return y * cos.float()[:, None] + rotated * sin.float()[:, None]
+
+
+def _qk_norm_rope(query, key, value, q_weight, k_weight, eps, cos, sin, heads, out, seq_major, fp8=None):
+    """The q/k kernel on ``[b, s, h * d]`` q, k, v into ``out``: the send buffer
+    ``[P, s, b, 3, h/P, d]`` if ``seq_major`` (in FP8 with ``fp8``, the rotation and the q, k,
+    v scales), else ``[b, s, 2, h, d]`` q and k."""
     head_dim = query.shape[-1] // heads
-    if seq_major:
-        heads_per_rank = out.shape[4]
-        strides = (out.stride(0), out.stride(1), out.stride(2), out.stride(3))
-    else:
-        heads_per_rank = heads
-        strides = (0, out.stride(1), out.stride(0), out.stride(2))
-    if batch * seq_len:
-        _qk_norm_rope_kernel[(batch * seq_len, triton.cdiv(heads, _QK_HEADS_PER_PROGRAM))](
-            query,
-            key,
-            value,
-            q_weight,
-            k_weight,
-            cos,
-            sin,
-            out,
-            seq_len,
-            heads,
-            heads_per_rank,
-            eps,
-            query.stride(0),
-            query.stride(1),
-            cos.stride(0),
-            *strides,
-            WRITE_V=seq_major,
-            HEADS=_QK_HEADS_PER_PROGRAM,
-            HEAD_DIM=head_dim,
-            num_warps=_QK_NUM_WARPS,
+    fp8_dtype = None if fp8 is None else out.dtype
+    if flux3_block_flydsl.qk_supported(query, cos, sin, q_weight, k_weight, heads, head_dim, fp8_dtype):
+        return flux3_block_flydsl.launch_qk_norm_rope(
+            query, key, value, q_weight, k_weight, eps, cos, sin, heads, out, seq_major, fp8
         )
+    parts = [_norm_rope(x, weight, eps, cos, sin, heads) for x, weight in ((query, q_weight), (key, k_weight))]
+    if fp8 is not None:
+        rotation, *scales = fp8
+        parts = [(part.to(torch.bfloat16) @ rotation).float() for part in parts]
+        parts.append(value.float().unflatten(-1, (heads, -1)))
+        fp8_max = torch.finfo(out.dtype).max
+        parts = [(part / scale).clamp(-fp8_max, fp8_max) for part, scale in zip(parts, scales)]
+    elif seq_major:
+        parts.append(value.unflatten(-1, (heads, -1)))
+    for which, part in enumerate(parts):
+        if seq_major:
+            out[:, :, :, which] = part.unflatten(2, (out.shape[0], -1)).permute(2, 1, 0, 3, 4)
+        else:
+            out[:, :, which] = part
     return out
 
 
@@ -350,7 +105,7 @@ def qk_norm_rope_seq_major_send(
         raise ValueError(f"{heads} heads do not split over {world_size} ranks.")
     batch, seq_len, _ = query.shape
     out = query.new_empty(world_size, seq_len, batch, 3, heads // world_size, head_dim)
-    return _launch_qk_norm_rope(query, key, value, q_weight, k_weight, eps, cos, sin, heads, out, seq_major=True)
+    return _qk_norm_rope(query, key, value, q_weight, k_weight, eps, cos, sin, heads, out, seq_major=True)
 
 
 @qk_norm_rope_seq_major_send.register_fake
@@ -390,37 +145,8 @@ def qk_norm_rope_seq_major_send_fp8(
             raise ValueError(f"{name} must be a one-element fp32 tensor, got {tuple(scale.shape)} {scale.dtype}.")
     batch, seq_len, _ = query.shape
     out = query.new_empty(world_size, seq_len, batch, 3, heads // world_size, head_dim, dtype=fp8_dtype)
-    if batch * seq_len:
-        _qk_norm_rope_fp8_send_kernel[(batch * seq_len, triton.cdiv(heads, _QK_FP8_HEADS_PER_PROGRAM))](
-            query,
-            key,
-            value,
-            q_weight,
-            k_weight,
-            cos,
-            sin,
-            rotation,
-            q_scale,
-            k_scale,
-            v_scale,
-            out,
-            seq_len,
-            heads,
-            heads // world_size,
-            eps,
-            torch.finfo(fp8_dtype).max,
-            query.stride(0),
-            query.stride(1),
-            cos.stride(0),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
-            HEADS=_QK_FP8_HEADS_PER_PROGRAM,
-            HEAD_DIM=head_dim,
-            num_warps=_QK_FP8_NUM_WARPS,
-        )
-    return out
+    fp8 = (rotation, q_scale, k_scale, v_scale)
+    return _qk_norm_rope(query, key, value, q_weight, k_weight, eps, cos, sin, heads, out, True, fp8)
 
 
 @qk_norm_rope_seq_major_send_fp8.register_fake
@@ -460,13 +186,26 @@ def qk_norm_rope(
     head_dim = _check_qk_inputs(query, key, key, q_weight, k_weight, cos, sin, heads)
     batch, seq_len, _ = query.shape
     out = query.new_empty(batch, seq_len, 2, heads, head_dim)
-    return _launch_qk_norm_rope(query, key, key, q_weight, k_weight, eps, cos, sin, heads, out, seq_major=False)
+    return _qk_norm_rope(query, key, key, q_weight, k_weight, eps, cos, sin, heads, out, seq_major=False)
 
 
 @qk_norm_rope.register_fake
 def _(query, key, q_weight, k_weight, eps, cos, sin, heads):
     batch, seq_len, cols = query.shape
     return query.new_empty(batch, seq_len, 2, heads, cols // heads)
+
+
+def _gated_residual_reference(segments, branches, eps):
+    """The joint hidden state and fp32 modulated norm of ``segments`` in torch."""
+    hidden, normed, offset = [], [], 0
+    for x, gate, shift, scale in segments:
+        rows = slice(offset, offset + x.shape[1])
+        branch = sum(output[:, rows].float() for output in branches)
+        h = (x.float() + gate.float() * branch).to(x.dtype)
+        hidden.append(h)
+        normed.append((1 + scale.float()) * F.layer_norm(h.float(), (h.shape[-1],), eps=eps) + shift.float())
+        offset += x.shape[1]
+    return torch.cat(hidden, dim=1), torch.cat(normed, dim=1)
 
 
 def _gated_residual_layernorm_modulate(xs, gates, shifts, scales, branches, eps, quantize):
@@ -483,13 +222,6 @@ def _gated_residual_layernorm_modulate(xs, gates, shifts, scales, branches, eps,
     if any(branch.shape != (batch, rows_per_batch, cols) for branch in branches):
         shapes = [tuple(branch.shape) for branch in branches]
         raise ValueError(f"The branch outputs must be [{batch}, {rows_per_batch}, {cols}], got {shapes}.")
-    hidden = xs[0].new_empty(batch, rows_per_batch, cols)
-    if quantize:
-        out = hidden.new_empty(0)
-        fp4, quant_scale = mxfp4_fused_quant.mxfp4_buffers(batch * rows_per_batch, cols, hidden.device)
-    else:
-        out = torch.empty_like(hidden)
-        fp4 = quant_scale = hidden.new_empty(0, dtype=torch.uint8)
     segments = []
     for x, gate, shift, scale in zip(xs, gates, shifts, scales):
         for name, tensor in (("x", x), ("gate", gate), ("shift", shift), ("scale", scale)):
@@ -501,34 +233,20 @@ def _gated_residual_layernorm_modulate(xs, gates, shifts, scales, branches, eps,
     for branch in branches:
         if branch.stride(-1) != 1:
             raise ValueError(f"Branch outputs must be contiguous in their last dimension, got {branch.stride()}.")
-    if len(segments) == 1:
-        segments.append(segments[0])
-    branch0, branch1 = branches[0], branches[-1]
-    if batch * rows_per_batch:
-        _gated_residual_layernorm_modulate_kernel[(batch * rows_per_batch,)](
-            *segments[0],
-            *segments[1],
-            branch0,
-            branch1,
-            hidden,
-            out,
-            fp4,
-            quant_scale,
-            xs[0].shape[1],
-            rows_per_batch,
-            cols,
-            eps,
-            *(stride for segment in segments for tensor in segment for stride in tensor.stride()[:2]),
-            branch0.stride(0),
-            branch0.stride(1),
-            branch1.stride(0),
-            branch1.stride(1),
-            quant_scale.shape[1] if quantize else 0,
-            TWO_BRANCHES=len(branches) == 2,
-            QUANTIZE=quantize,
-            BLOCK=triton.next_power_of_2(cols),
-            num_warps=_ROW_NUM_WARPS,
-        )
+    tensors = [tensor for segment in segments for tensor in segment] + list(branches)
+    if not flux3_block_flydsl.rows_supported(cols, *tensors):
+        hidden, normed = _gated_residual_reference(segments, branches, eps)
+        if not quantize:
+            return hidden, normed.to(hidden.dtype), None, None
+        return (hidden, None, *mxfp4_fused_quant.hip_quant(normed.to(torch.bfloat16).flatten(0, 1)))
+    hidden = xs[0].new_empty(batch, rows_per_batch, cols)
+    if quantize:
+        out = hidden.new_empty(0)
+        fp4, quant_scale = mxfp4_fused_quant.mxfp4_buffers(batch * rows_per_batch, cols, hidden.device)
+    else:
+        out = torch.empty_like(hidden)
+        fp4 = quant_scale = hidden.new_empty(0, dtype=torch.uint8)
+    flux3_block_flydsl.launch_block_rows(segments, branches, eps, hidden, out, fp4, quant_scale, quantize)
     return hidden, out, fp4, quant_scale
 
 

@@ -1,6 +1,6 @@
 """The fused FLUX.3 block kernels must compute upstream's math.
 
-They round once from fp32, as upstream does, but Triton's fp32 rsqrt, sums and fused
+They round once from fp32, as upstream does, but FlyDSL's fp32 rsqrt, sums and fused
 multiply-adds can differ from torch's in the last bit: in fp32 outputs that shows in most
 values, in bf16 it rarely flips a rounding. The bf16 residual is exact; the quantized norm
 must match the HIP quantization of the reference norm.
@@ -14,7 +14,7 @@ fused_block_ops = pytest.importorskip("xfuser.model_executor.layers.fused_block_
 from xfuser.model_executor.layers.usp import _seq_major_qkv_send  # noqa: E402
 
 if not fused_block_ops.FUSED_BLOCK_OPS_AVAILABLE:
-    pytest.skip("Triton is unavailable.", allow_module_level=True)
+    pytest.skip("FlyDSL is unavailable.", allow_module_level=True)
 
 HEADS, HEAD_DIM, DIM, EPS = 24, 128, 3072, 1e-6
 
@@ -151,7 +151,7 @@ def test_gated_residual_quant_matches_hip_quant_of_the_reference(lengths, branch
     from xfuser.model_executor.layers import mxfp4_fused_quant
 
     if not mxfp4_fused_quant.MXFP4_FUSED_QUANT_AVAILABLE:
-        pytest.skip("AITER's Triton MXFP4 helpers are unavailable.")
+        pytest.skip("AITER's FlyDSL MX helpers are unavailable.")
     generator = torch.Generator(device="cuda").manual_seed(0)
     segments = _segments(lengths, torch.bfloat16, generator)
     branches = [
