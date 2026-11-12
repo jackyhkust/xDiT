@@ -40,9 +40,9 @@ try:
     from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled, ptr_arg
     from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
-    HAS_FLYDSL = True
+    _HAS_FLYDSL = True
 except Exception:  # pragma: no cover - only where FlyDSL/AITER are absent
-    HAS_FLYDSL = False
+    _HAS_FLYDSL = False
 
 WAVE_SIZE = 64
 # Channels per lane: one 128-bit bf16 access.
@@ -53,7 +53,8 @@ MAX_BLOCK_THREADS = 1024
 HADAMARD_BLOCK = 128
 
 
-def _scale_cols(cols: int) -> int:
+def mxfp4_scale_cols(cols: int) -> int:
+    """Columns of the shuffled E8M0 scales of ``cols``-column rows, as the HIP quantization pads them."""
     return (cols // 32 + 7) // 8 * 8
 
 
@@ -93,18 +94,16 @@ def _group_sum(value, width):
     return value
 
 
-def _mad(a, b, c, contract):
-    return fmath.fma(a, b, c) if contract else a * b + c
-
-
-def _store_mxfp4(values, row, col, fp4_row, scale_i8, n32, group_offset):
-    """Quantize 8 fp32 values holding bf16 ones, columns ``col`` onwards of ``row``; the 4
-    lanes of each 32-column group are adjacent, and all write its (identical) scale."""
+def mxfp4_pack(values):
+    """The E8M0 exponent and packed E2M1 word of a lane's ``VEC`` fp32 values holding bf16
+    ones, the ``32 // VEC`` lanes of each 32-column group adjacent in the wave."""
     amax = fx.Float32(0.0)
     for v in values:
         amax = amax.maximumf(fmath.absf(v))
-    for dist in (1, 2):
+    dist = 1
+    while dist < 32 // VEC:
         amax = amax.maximumf(amax.shuffle_xor(fx.Int32(dist), fx.Int32(WAVE_SIZE)))
+        dist *= 2
     amax = amax.maximumf(fx.Float32(1e-10))
     exponent = fx.Int32(
         emit_mx_e8m0_scale(amax.ir_value(), mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP4_E2M1)
@@ -114,9 +113,13 @@ def _store_mxfp4(values, row, col, fp4_row, scale_i8, n32, group_offset):
     packed = nibbles[0] | (nibbles[1] << 4)
     for k in range(1, VEC // 2):
         packed = packed | ((nibbles[2 * k] | (nibbles[2 * k + 1] << 4)) << (k * 8))
-    fp4_row.store(col >> 3, packed)
-    group = fx.Int32(group_offset) + (col >> 5)
-    offset = (
+    return exponent, packed
+
+
+def mxfp4_scale_offset(row, group, n32):
+    """Byte offset of the scale of 32-column ``group`` of ``row`` in the HIP quantization's
+    shuffled layout, ``n32`` its scale columns times 32."""
+    return (
         (row >> 5) * n32
         + (group >> 3) * 256
         + (group & 3) * 64
@@ -124,7 +127,14 @@ def _store_mxfp4(values, row, col, fp4_row, scale_i8, n32, group_offset):
         + ((group >> 2) & 1) * 2
         + ((row >> 4) & 1)
     )
-    scale_i8[offset] = exponent.to(fx.Int8)
+
+
+def _store_mxfp4(values, row, col, fp4_row, scale_i8, n32, group_offset):
+    """Quantize 8 fp32 values holding bf16 ones, columns ``col`` onwards of ``row``; all 4
+    lanes of each 32-column group write its (identical) scale."""
+    exponent, packed = mxfp4_pack(values)
+    fp4_row.store(col >> 3, packed)
+    scale_i8[mxfp4_scale_offset(row, fx.Int32(group_offset) + (col >> 5), n32)] = exponent.to(fx.Int8)
 
 
 def _scale_pointer(scale):
@@ -159,7 +169,7 @@ def _hardware_fp8_dtype(device: torch.device) -> Optional[torch.dtype]:
     return {"gfx950": torch.float8_e4m3fn, "gfx942": torch.float8_e4m3fnuz}.get(arch.split(":")[0])
 
 
-if HAS_FLYDSL:
+if _HAS_FLYDSL:
 
     @lru_cache(maxsize=32)
     def _build_qk_kernel(
@@ -171,7 +181,6 @@ if HAS_FLYDSL:
         rope_f32: bool,
         write_v: bool,
         fp8_dtype: Optional[torch.dtype],
-        contract: bool,
     ):
         lanes_per_head = head_dim // VEC
         threads = heads * lanes_per_head
@@ -185,7 +194,7 @@ if HAS_FLYDSL:
         out_bytes = 1 if fp8 else 2
         name = (
             f"flux3_qk_norm_rope_h{heads}_d{head_dim}_p{heads_per_rank}_w{int(weight_f32)}{int(rope_f32)}"
-            f"_v{int(write_v)}_{str(fp8_dtype).rsplit('_', 1)[-1] if fp8 else 'bf16'}_c{int(contract)}_flydsl"
+            f"_v{int(write_v)}_{str(fp8_dtype).rsplit('_', 1)[-1] if fp8 else 'bf16'}_flydsl"
         )
 
         @flyc.kernel(name=name)
@@ -237,14 +246,14 @@ if HAS_FLYDSL:
                 w = _load_f32(GTensor(fx.Int64(fx.ptrtoint(w_ptr)), weight_dtype, (-1,)), dim, VEC, weight_f32)
                 squares = fx.Float32(0.0)
                 for i in range_constexpr(VEC):
-                    squares = _mad(x[i], x[i], squares, contract)
+                    squares = fmath.fma(x[i], x[i], squares)
                 rstd = fmath.rsqrt(_group_sum(squares, lanes_per_head) * inv_head_dim + eps)
                 y = [x[i] * rstd * w[i] for i in range_constexpr(VEC)]
                 outs = []
                 for p in range_constexpr(VEC // 2):
                     even, odd = y[2 * p], y[2 * p + 1]
-                    outs.append(_mad(even, cos_v[2 * p], -odd * sin_v[2 * p], contract))
-                    outs.append(_mad(odd, cos_v[2 * p + 1], even * sin_v[2 * p + 1], contract))
+                    outs.append(fmath.fma(even, cos_v[2 * p], -odd * sin_v[2 * p]))
+                    outs.append(fmath.fma(odd, cos_v[2 * p + 1], even * sin_v[2 * p + 1]))
                 return outs
 
             def store_fp8(values, scale_ptr, offset):
@@ -337,10 +346,10 @@ if HAS_FLYDSL:
         return launch
 
     @lru_cache(maxsize=32)
-    def _build_row_kernel(cols: int, residual: bool, two_branches: bool, quantize: bool, eps: float, contract: bool):
+    def _build_row_kernel(cols: int, residual: bool, two_branches: bool, quantize: bool, eps: float):
         n_iters = cols // ROW_COLS
-        n32 = _scale_cols(cols) * 32
-        name = f"flux3_block_rows_c{cols}_r{int(residual)}{int(two_branches)}_q{int(quantize)}_c{int(contract)}_flydsl"
+        n32 = mxfp4_scale_cols(cols) * 32
+        name = f"flux3_block_rows_c{cols}_r{int(residual)}{int(two_branches)}_q{int(quantize)}_flydsl"
 
         @flyc.kernel(name=name)
         def kernel(
@@ -416,7 +425,7 @@ if HAS_FLYDSL:
                             False,
                         )
                         branch = [branch[i] + other[i] for i in range_constexpr(VEC)]
-                    summed = _bf16_vector([_mad(gate[i], branch[i], x[i], contract) for i in range_constexpr(VEC)])
+                    summed = _bf16_vector([fmath.fma(gate[i], branch[i], x[i]) for i in range_constexpr(VEC)])
                     GTensor(_addr(hidden, row_elems, 2), T.bf16, (-1,)).store(col, summed)
                     rounded = fx.Vector(summed).to(fx.Float32)
                     x = [rounded[i] for i in range_constexpr(VEC)]
@@ -431,7 +440,7 @@ if HAS_FLYDSL:
             for it in range_constexpr(n_iters):
                 for i in range_constexpr(VEC):
                     centered = values[it][i] - mean
-                    squares = _mad(centered, centered, squares, contract)
+                    squares = fmath.fma(centered, centered, squares)
             rstd = fmath.rsqrt(_group_sum(squares, WAVE_SIZE) / fx.Float32(float(cols)) + eps)
 
             out_t = GTensor(_addr(out, row_elems, 2), T.bf16, (-1,))
@@ -441,10 +450,7 @@ if HAS_FLYDSL:
                 col = lane * VEC + it * ROW_COLS
                 shift = _load_f32(shift_t, col, VEC, False)
                 scale = _load_f32(scale_t, col, VEC, False)
-                y = [
-                    _mad(1.0 + scale[i], (values[it][i] - mean) * rstd, shift[i], contract)
-                    for i in range_constexpr(VEC)
-                ]
+                y = [fmath.fma(1.0 + scale[i], (values[it][i] - mean) * rstd, shift[i]) for i in range_constexpr(VEC)]
                 if const_expr(quantize):
                     _store_mxfp4(_round_bf16(y), row, col, fp4_t, scale_i8, n32, 0)
                 else:
@@ -537,7 +543,7 @@ if HAS_FLYDSL:
         cols: int, chunk_cols: int, out_cols: int, col_offset: int, fp8_dtype: Optional[torch.dtype]
     ):
         n_iters = cols // ROW_COLS
-        n32 = _scale_cols(out_cols) * 32
+        n32 = mxfp4_scale_cols(out_cols) * 32
         fp8 = fp8_dtype is not None
         in_bytes = 1 if fp8 else 2
         name = (
@@ -604,7 +610,7 @@ if HAS_FLYDSL:
 
 
 def _flydsl_device(tensor: torch.Tensor) -> bool:
-    return HAS_FLYDSL and tensor.is_cuda and get_device_wave_size(tensor) == WAVE_SIZE
+    return _HAS_FLYDSL and tensor.is_cuda and get_device_wave_size(tensor) == WAVE_SIZE
 
 
 def _aligned_rows(tensor: torch.Tensor, dtypes=(torch.bfloat16,)) -> bool:
@@ -687,7 +693,6 @@ def launch_qk_norm_rope(
     out: torch.Tensor,
     seq_major: bool,
     fp8_scales: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    contract: bool = True,
 ) -> torch.Tensor:
     """``fused_block_ops``' q/k kernel on ``[b, s, h * d]`` q, k, v into ``out``: the send
     buffer ``[P, s, b, 3, h/P, d]`` if ``seq_major`` (in FP8 with ``fp8_scales``, the
@@ -712,29 +717,27 @@ def launch_qk_norm_rope(
         cos.dtype == torch.float32,
         seq_major,
         fp8_dtype,
-        contract,
     )
     rotation, q_scale, k_scale, v_scale = fp8_scales if fp8_scales is not None else (out,) * 4
-    with torch.cuda.device(query.device.index):
-        _run_compiled(
-            launcher,
-            ptr_arg(query),
-            ptr_arg(key),
-            ptr_arg(value),
-            ptr_arg(q_weight),
-            ptr_arg(k_weight),
-            ptr_arg(cos),
-            ptr_arg(sin),
-            ptr_arg(rotation),
-            ptr_arg(q_scale),
-            ptr_arg(k_scale),
-            ptr_arg(v_scale),
-            ptr_arg(out),
-            seq_len,
-            *_int32(query.stride(0), query.stride(1), cos.stride(0), *strides),
-            batch * seq_len,
-            torch.cuda.current_stream(),
-        )
+    _run_compiled(
+        launcher,
+        ptr_arg(query),
+        ptr_arg(key),
+        ptr_arg(value),
+        ptr_arg(q_weight),
+        ptr_arg(k_weight),
+        ptr_arg(cos),
+        ptr_arg(sin),
+        ptr_arg(rotation),
+        ptr_arg(q_scale),
+        ptr_arg(k_scale),
+        ptr_arg(v_scale),
+        ptr_arg(out),
+        seq_len,
+        *_int32(query.stride(0), query.stride(1), cos.stride(0), *strides),
+        batch * seq_len,
+        torch.cuda.current_stream(query.device),
+    )
     return out
 
 
@@ -747,7 +750,6 @@ def launch_block_rows(
     fp4: torch.Tensor,
     quant_scale: torch.Tensor,
     quantize: bool,
-    contract: bool = True,
 ) -> None:
     """The row kernel over one or two segments laid end to end along the sequence: each
     ``(x, gate, shift, scale)`` (``gate`` None and no ``branches`` for a plain modulated
@@ -763,7 +765,7 @@ def launch_block_rows(
     rows_per_batch = seq_len0 + (segments[1][0].shape[1] if segments[1] is not segments[0] else 0)
     if not batch * rows_per_batch:
         return
-    launcher = _build_row_kernel(cols, residual, len(branches) == 2, quantize, float(eps), contract)
+    launcher = _build_row_kernel(cols, residual, len(branches) == 2, quantize, float(eps))
     pointers, strides = [], []
     for x, gate, shift, scale in segments:
         for tensor in (x, x if gate is None else gate, shift, scale):
@@ -771,22 +773,21 @@ def launch_block_rows(
             strides += tensor.stride()[:2]
     branch0 = branches[0] if residual else x0
     branch1 = branches[-1] if residual else x0
-    with torch.cuda.device(x0.device.index):
-        _run_compiled(
-            launcher,
-            *pointers,
-            ptr_arg(branch0),
-            ptr_arg(branch1),
-            ptr_arg(hidden),
-            ptr_arg(out),
-            ptr_arg(fp4),
-            ptr_arg(quant_scale),
-            seq_len0,
-            rows_per_batch,
-            *_int32(*strides, *branch0.stride()[:2], *branch1.stride()[:2]),
-            batch * rows_per_batch,
-            torch.cuda.current_stream(),
-        )
+    _run_compiled(
+        launcher,
+        *pointers,
+        ptr_arg(branch0),
+        ptr_arg(branch1),
+        ptr_arg(hidden),
+        ptr_arg(out),
+        ptr_arg(fp4),
+        ptr_arg(quant_scale),
+        seq_len0,
+        rows_per_batch,
+        *_int32(*strides, *branch0.stride()[:2], *branch1.stride()[:2]),
+        batch * rows_per_batch,
+        torch.cuda.current_stream(x0.device),
+    )
 
 
 def launch_seq_major_output_mxfp4(
@@ -805,15 +806,14 @@ def launch_seq_major_output_mxfp4(
     launcher = _build_seq_major_output_kernel(
         cols, heads * head_dim, fp4.shape[1] * 2, col_offset, None if descale is None else received.dtype
     )
-    with torch.cuda.device(received.device.index):
-        _run_compiled(
-            launcher,
-            ptr_arg(received),
-            ptr_arg(fp4),
-            ptr_arg(quant_scale),
-            ptr_arg(received if descale is None else descale),
-            seq_len,
-            *_int32(received.stride(0), received.stride(1), received.stride(2)),
-            batch * seq_len,
-            torch.cuda.current_stream(),
-        )
+    _run_compiled(
+        launcher,
+        ptr_arg(received),
+        ptr_arg(fp4),
+        ptr_arg(quant_scale),
+        ptr_arg(received if descale is None else descale),
+        seq_len,
+        *_int32(received.stride(0), received.stride(1), received.stride(2)),
+        batch * seq_len,
+        torch.cuda.current_stream(received.device),
+    )

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from xfuser.model_executor.layers import flux3_block_flydsl, mxfp4_fused_quant
 
-FUSED_BLOCK_OPS_AVAILABLE = flux3_block_flydsl.HAS_FLYDSL
+FUSED_BLOCK_OPS_AVAILABLE = flux3_block_flydsl._HAS_FLYDSL
 
 
 def _check_qk_inputs(query, key, value, q_weight, k_weight, cos, sin, heads):

@@ -27,7 +27,7 @@ import torch
 
 from xfuser.model_executor.layers import flux3_block_flydsl, swiglu_mxfp4_flydsl
 
-MXFP4_FUSED_QUANT_AVAILABLE = swiglu_mxfp4_flydsl._HAS_FLYDSL and flux3_block_flydsl.HAS_FLYDSL
+MXFP4_FUSED_QUANT_AVAILABLE = swiglu_mxfp4_flydsl._HAS_FLYDSL and flux3_block_flydsl._HAS_FLYDSL
 
 
 def mxfp4_buffers(rows: int, cols: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -36,7 +36,9 @@ def mxfp4_buffers(rows: int, cols: int, device: torch.device) -> Tuple[torch.Ten
     if cols % 32:
         raise ValueError(f"MXFP4 quantizes groups of 32 columns, got {cols} columns.")
     fp4 = torch.empty(rows, cols // 2, dtype=torch.uint8, device=device)
-    scale = torch.empty((rows + 255) // 256 * 256, (cols // 32 + 7) // 8 * 8, dtype=torch.uint8, device=device)
+    scale = torch.empty(
+        (rows + 255) // 256 * 256, flux3_block_flydsl.mxfp4_scale_cols(cols), dtype=torch.uint8, device=device
+    )
     return fp4, scale
 
 

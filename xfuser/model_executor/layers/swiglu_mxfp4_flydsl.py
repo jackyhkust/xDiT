@@ -22,6 +22,7 @@ from functools import lru_cache
 
 import torch
 
+from xfuser.model_executor.layers.flux3_block_flydsl import VEC, WAVE_SIZE, mxfp4_pack, mxfp4_scale_offset
 from xfuser.model_executor.layers.flydsl_utils import get_device_wave_size
 
 try:
@@ -31,18 +32,13 @@ try:
     from flydsl.expr.typing import Int32, T
 
     from aiter.ops.flydsl.kernels.act import sigmoid_f32
-    from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
-    from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
     _HAS_FLYDSL = True
 except Exception:  # pragma: no cover - only where FlyDSL/AITER are absent
     _HAS_FLYDSL = False
 
 BLOCK_THREADS = 256
-WAVE_SIZE = 64
-# One bf16 buffer load moves at most 128 bits.
-VEC = 8
 
 
 if _HAS_FLYDSL:
@@ -54,8 +50,6 @@ if _HAS_FLYDSL:
         cols_per_iter = BLOCK_THREADS * VEC
         n_iters = (cols + cols_per_iter - 1) // cols_per_iter
         pad_cols = n_iters * cols_per_iter
-        threads_per_group = 32 // VEC
-        shuffle_dists = [1 << i for i in range(threads_per_group.bit_length() - 1)]
         n32 = scale_cols * 32
         group_offset = col_offset // 32
         out_row_bytes = out_cols // 2
@@ -120,38 +114,14 @@ if _HAS_FLYDSL:
                     act = [gate[i] * sigmoid_f32(gate[i]) * up[i] for i in range_constexpr(VEC)]
                     rounded = fx.Vector.from_elements([a.ir_value() for a in act], dtype=fx.Float32)
                     rounded = fx.Vector(rounded.truncf(vec_bf16)).extf(vec_f32)
-                    act = [rounded[i] for i in range_constexpr(VEC)]
-
-                    amax = fx.Float32(0.0)
-                    for i in range_constexpr(VEC):
-                        amax = amax.maximumf(fx.math.absf(act[i]))
-                    for dist in shuffle_dists:
-                        amax = amax.maximumf(amax.shuffle_xor(fx.Int32(dist), fx.Int32(WAVE_SIZE)))
-                    amax = amax.maximumf(fx.Float32(1e-10))
-                    exponent = fx.Int32(
-                        emit_mx_e8m0_scale(amax.ir_value(), mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP4_E2M1)
-                    )
-                    inverse = ((fx.Int32(254) - exponent) << fx.Int32(23)).bitcast(fx.Float32)
-
-                    nibbles = [fx.Int32(emit_f32_to_e2m1((act[i] * inverse).ir_value())) for i in range_constexpr(VEC)]
-                    packed = nibbles[0] | (nibbles[1] << 4)
-                    for k in range_constexpr(1, VEC // 2):
-                        packed = packed | ((nibbles[2 * k] | (nibbles[2 * k + 1] << 4)) << (k * 8))
+                    exponent, packed = mxfp4_pack([rounded[i] for i in range_constexpr(VEC)])
                     p_out = part_st(out_bt)
                     out_frag = fx.make_fragment_like(p_out)
                     fx.memref_store_vec(fx.Vector.from_elements([packed], dtype=fx.Int32).bitcast(fx.Int8), out_frag)
                     fx.copy(copy_st, out_frag, p_out)
 
                     if (col0 & 31) == 0:
-                        group = fx.Int32(group_offset) + (col0 >> 5)
-                        offset = (
-                            (row >> 5) * n32
-                            + (group >> 3) * 256
-                            + (group & 3) * 64
-                            + (row & 15) * 4
-                            + ((group >> 2) & 1) * 2
-                            + ((row >> 4) & 1)
-                        )
+                        offset = mxfp4_scale_offset(row, fx.Int32(group_offset) + (col0 >> 5), n32)
                         scale_i8[fx.Int32(offset)] = exponent.to(fx.Int8)
 
         @flyc.jit
@@ -182,13 +152,12 @@ def launch_swiglu_mxfp4(rows: torch.Tensor, fp4: torch.Tensor, quant_scale: torc
     if not rows.shape[0]:
         return
     launcher = _build_kernel(rows.shape[1] // 2, fp4.shape[1] * 2, col_offset, quant_scale.shape[1])
-    with torch.cuda.device(rows.device.index):
-        _run_compiled(
-            launcher,
-            ptr_arg(rows),
-            ptr_arg(fp4),
-            ptr_arg(quant_scale),
-            rows.stride(0),
-            rows.shape[0],
-            torch.cuda.current_stream(),
-        )
+    _run_compiled(
+        launcher,
+        ptr_arg(rows),
+        ptr_arg(fp4),
+        ptr_arg(quant_scale),
+        rows.stride(0),
+        rows.shape[0],
+        torch.cuda.current_stream(rows.device),
+    )
