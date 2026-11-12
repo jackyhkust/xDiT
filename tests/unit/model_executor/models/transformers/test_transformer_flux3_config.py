@@ -188,6 +188,7 @@ def _seq_major_processor(monkeypatch, settings, change):
     monkeypatch.setattr(transformer_flux3, "get_runtime_state", lambda: state)
     monkeypatch.setattr(transformer_flux3, "get_ulysses_parallel_world_size", lambda: settings["ulysses"])
     monkeypatch.setattr(transformer_flux3, "get_ring_parallel_world_size", lambda: settings["ring"])
+    monkeypatch.setattr(transformer_flux3.usp_sdma, "selected", lambda: change.get("sdma", False))
     processor = transformer_flux3.xFuserFlux3AttnProcessor()
     processor.local = change.get("local", False)
     if change.get("disabled"):
@@ -207,6 +208,7 @@ def _seq_major_processor(monkeypatch, settings, change):
         ({"fp8_comms": object()}, None),  # FP8 comms with bf16 attention
         ({"capture_bypass": True}, None),
         ({"disabled": True}, None),
+        ({"sdma": True}, None),  # --ulysses_a2a sdma or packed: USP's exchange
     ],
 )
 def test_only_plain_ulysses_aiter_attention_takes_the_seq_major_exchange(monkeypatch, change, expected):
@@ -227,6 +229,7 @@ def test_only_plain_ulysses_aiter_attention_takes_the_seq_major_exchange(monkeyp
         ({"ring": 2}, None),
         ({"local": True}, None),
         ({"disabled": True}, None),
+        ({"sdma": True}, None),  # --ulysses_a2a sdma or packed: USP's exchange
     ],
 )
 def test_calibrated_fp8_comms_take_the_fp8_seq_major_exchange(monkeypatch, change, expected):

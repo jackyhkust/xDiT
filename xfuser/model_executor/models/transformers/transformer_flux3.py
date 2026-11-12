@@ -126,8 +126,9 @@ class xFuserFlux3AttnProcessor:
 
         ``"fp8"`` is AITER's FP8 attention with FP8 Ulysses comms once this layer's scales
         are calibrated; the calibration pass itself runs through USP, which measures them.
+        Under ``--ulysses_a2a sdma`` or ``packed`` the exchange is USP's (``usp_sdma``).
         """
-        if self.local or not self.seq_major_ulysses:
+        if self.local or not self.seq_major_ulysses or usp_sdma.selected():
             return None
         ulysses_degree = get_ulysses_parallel_world_size()
         if ulysses_degree <= 1 or get_ring_parallel_world_size() > 1 or attn.heads % ulysses_degree:
