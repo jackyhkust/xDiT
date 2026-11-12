@@ -1,6 +1,6 @@
 # This file implements USP with torch version >= '2.5.0'
 import functools
-from typing import Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed._functional_collectives as ft_c
@@ -34,7 +34,10 @@ from xfuser.core.attention import registry as attention_registry
 from xfuser.core.attention.spec import VarlenPacking
 from xfuser.core.attention.spec import AttnCall
 from xfuser.core.attention.spec import Sparsity
+from xfuser.core.attention.spec import Spec
 from xfuser.core.distributed.fp8_comms import (
+    Fp8CommsCall,
+    _per_tensor_quant,
     fp8_attention_kwargs,
     fp8_comms_input_all_to_all,
     fp8_comms_output_all_to_all,
@@ -216,77 +219,115 @@ def _seq_major_qkv_views(received):
     return tuple(joined[:, :, index].transpose(0, 1) for index in range(3))
 
 
-def _seq_major_output_send(out):
-    """BSHD attention output ``[b, P*s, h/P, d]`` as a ``[P*s, b, h/P, d]`` send buffer:
-    chunk ``p`` holds rank ``p``'s tokens."""
-    return out.transpose(0, 1).contiguous()
-
-
 def seq_major_attention_output(received):
     """The ``[b, s, P * h/P * d]`` rows of a received ``[P, s, b, h/P, d]`` attention output."""
     world_size, s, b, heads, d = received.shape
     return received.permute(2, 1, 0, 3, 4).reshape(b, s, world_size * heads * d)
 
 
-def ulysses_aiter_attention(query, key, value, valid_kv_len=None):
-    """Ulysses-only attention with AITER's dense kernel on BSHD q, k, v.
+class SeqMajorPlan(NamedTuple):
+    """How ``usp_seq_major`` runs one attention call; see ``usp_seq_major_plan``."""
 
-    Same result as ``USP`` with the AITER backend and ``combine_qkv_a2a=True``, without the
-    BHSD round trips: q, k and v travel in one sequence-major exchange and reach the kernel
-    as strided BSHD views, which it reads directly, so no copy runs between the exchange and
-    the kernel. ``valid_kv_len`` drops a uniform trailing K/V pad.
+    spec: Spec
+    world_size: int
+    # The layer's calibrated fp8-comms scales when q, k, v and the output travel in FP8.
+    fp8_comms: Optional[Fp8CommsCall]
+
+
+def usp_seq_major_plan(attn_layer, heads, backend=None) -> Optional[SeqMajorPlan]:
+    """The plan of a self-attention call that may take USP's sequence-major Ulysses exchange,
+    or None when it takes ``USP``.
+
+    The sequence-major exchange sends q, k and v as one ``[P, s, b, 3, h/P, d]`` buffer --
+    destination rank, then sequence position -- so the received chunks join into strided BSHD
+    views over the whole sequence, which the kernel reads without a copy, and the output
+    returns as ``[P, s, b, h/P, d]``. It serves Ulysses-only calls on a backend whose spec
+    ``reads_strided_bshd``, without what ``USP`` adds around its exchange (joint tensors, KV
+    caching, head balancing, SDMA, the compile-capture bypass). While ``attn_layer``'s model
+    calibrates fp8 comms its calls take ``USP``, which observes them; once calibrated, a
+    backend that ``accepts_prequantized`` exchanges FP8 q, k, v and output.
+    """
+    if _compile_capture_bypasses_attention() or usp_sdma.selected():
+        return None
+    world_size, ring_world_size = _parallel_degrees()
+    if world_size <= 1 or ring_world_size > 1 or heads % world_size:
+        return None
+    runtime_state = get_runtime_state()
+    backend = backend if backend is not None else runtime_state.attention_backend
+    spec = attention_registry.find(backend)
+    if spec is None or not spec.reads_strided_bshd or _has_kv_cache(attn_layer):
+        return None
+    if spec.head_balanced and runtime_state.runtime_config.use_spargeattn_head_balance:
+        return None
+    model_state = _fp8_comms_model_state(runtime_state.fp8_comms, attn_layer)
+    if model_state is not None and not model_state.synced:
+        return None
+    fp8_comms = None
+    if model_state is not None and spec.accepts_prequantized:
+        fp8_comms = Fp8CommsCall(
+            attn_layer.fp8_q_scale, attn_layer.fp8_k_scale, attn_layer.fp8_v_scale, attn_layer.fp8_o_scale
+        )
+    return SeqMajorPlan(spec, world_size, fp8_comms)
+
+
+def _fp8_comms_model_state(fp8_comms, attn_layer):
+    """The fp8-comms calibration state of ``attn_layer``'s model, or None for a layer without
+    fp8 comms."""
+    owner = getattr(attn_layer, "fp8_comms_owner", None)
+    if fp8_comms is None or owner is None or not hasattr(attn_layer, "fp8_comms_layer_idx"):
+        return None
+    return fp8_comms.get_model_state(owner)
+
+
+def usp_seq_major_send(query, key, value, plan: SeqMajorPlan):
+    """``usp_seq_major``'s ``[P, s, b, 3, h/P, d]`` send buffer from BSHD q, k, v. Under the
+    plan's fp8 comms, q and k are rotated for the backend and q, k, v quantized with the
+    layer's scales, as ``USP``'s FP8 exchange quantizes them."""
+    fp8_comms = plan.fp8_comms
+    if fp8_comms is not None and plan.spec.prequant_rotate is not None:
+        query, key = plan.spec.prequant_rotate(query, key)
+    send = _seq_major_qkv_send(query, key, value, plan.world_size)
+    if fp8_comms is None:
+        return send
+    scales = torch.cat([fp8_comms.q_scale, fp8_comms.k_scale, fp8_comms.v_scale]).view(3, 1, 1)
+    return _per_tensor_quant(send, scales)[0]
+
+
+def usp_seq_major(send, plan: SeqMajorPlan, attention_kwargs=None):
+    """Ulysses attention through the sequence-major exchange of ``send``, built by
+    ``usp_seq_major_send`` or by a kernel writing the same layout and quantization.
+
+    Same result as ``USP`` with the plan's backend: the selected spec runs the call, through
+    its ``accepts``, on the received views. ``attention_kwargs["valid_kv_len"]`` drops a
+    uniform trailing K/V pad, as in ``USP``.
 
     Returns the output exchange's receive buffer ``[P, s, b, h/P, d]``: chunk ``p`` holds
-    heads ``p * h/P`` onwards for this rank's ``s`` tokens. ``seq_major_attention_output``
+    heads ``p * h/P`` onwards for this rank's ``s`` tokens, in FP8 under the plan's fp8 comms,
+    where it dequantizes as ``x.float() * plan.fp8_comms.o_scale``. ``seq_major_attention_output``
     gives its ``[b, s, h * d]`` rows with one copy; a consumer may read it in place instead.
     """
-    send = _seq_major_qkv_send(query, key, value, get_ulysses_parallel_world_size())
-    return ulysses_aiter_attention_from_send(send, valid_kv_len)
-
-
-def ulysses_aiter_attention_from_send(send, valid_kv_len=None):
-    """``ulysses_aiter_attention`` from q, k, v already laid out as the ``[P, s, b, 3, h/P, d]``
-    send buffer, e.g. by the kernel that produced them."""
-    world_size = get_ulysses_parallel_world_size()
+    fp8_comms = plan.fp8_comms
     received = _sdpa_all_to_all_single(send)
-    query, key, value = _seq_major_qkv_views(received)
-    if valid_kv_len is not None:
-        if not 0 < valid_kv_len <= key.shape[1]:
-            raise ValueError(f"valid_kv_len must be in [1, {key.shape[1]}], got {valid_kv_len}.")
-        key, value = key[:, :valid_kv_len], value[:, :valid_kv_len]
-    out, _ = torch.ops.xfuser.aiter_attn(query, key, value, 0.0, False)
-    b, seq_len, heads, d = out.shape
-    received = _sdpa_all_to_all_single(_seq_major_output_send(out))
-    return received.view(world_size, seq_len // world_size, b, heads, d)
-
-
-def ulysses_aiter_fp8_attention_from_send(send, fp8_comms, valid_kv_len=None):
-    """``ulysses_aiter_attention_from_send`` with FP8 Ulysses comms and AITER's FP8 attention.
-
-    ``send`` is the FP8 ``[P, s, b, 3, h/P, d]`` send buffer, q and k Hadamard-rotated and
-    q, k, v quantized with ``fp8_comms``'s per-layer scales (``Fp8CommsCall``), as USP's FP8
-    path quantizes them. MHA v4 reads the received q, k, v views and writes the output send
-    buffer in place; the output travels in FP8 with ``fp8_comms.o_scale``. Returns the FP8
-    output receive buffer ``[P, s, b, h/P, d]``, which dequantizes as ``x.float() * o_scale``.
-    """
-    from xfuser.core.attention.backends.aiter_fp8.kernel import mha_v4_pre_quantized_bshd
-    from xfuser.core.distributed.fp8_comms import _per_tensor_quant
-
-    world_size = get_ulysses_parallel_world_size()
-    received = _sdpa_all_to_all_single(send)
-    query, key, value = _seq_major_qkv_views(received)
-    if valid_kv_len is not None:
-        if not 0 < valid_kv_len <= key.shape[1]:
-            raise ValueError(f"valid_kv_len must be in [1, {key.shape[1]}], got {valid_kv_len}.")
-        key, value = key[:, :valid_kv_len], value[:, :valid_kv_len]
-    b, seq_len, heads, d = query.shape
-    out = torch.empty(seq_len, b, heads, d, dtype=torch.bfloat16, device=query.device)
-    mha_v4_pre_quantized_bshd(
-        query, key, value, fp8_comms.q_scale, fp8_comms.k_scale, fp8_comms.v_scale, out.transpose(0, 1)
-    )
-    out_fp8, _ = _per_tensor_quant(out, fp8_comms.o_scale)
-    received = _sdpa_all_to_all_single(out_fp8)
-    return received.view(world_size, seq_len // world_size, b, heads, d)
+    query, key, value = (view.transpose(1, 2) for view in _seq_major_qkv_views(received))
+    kwargs = dict(attention_kwargs or {})
+    if fp8_comms is not None:
+        kwargs |= {
+            "pre_quantized": True,
+            "q_descale": fp8_comms.q_scale,
+            "k_descale": fp8_comms.k_scale,
+            "v_descale": fp8_comms.v_scale,
+        }
+    key, value, kwargs = _trim_trailing_kv_padding(key, value, kwargs, plan.spec.type)
+    batch, heads, seq_len, head_dim = query.shape
+    dtype = torch.bfloat16 if fp8_comms is not None else query.dtype
+    # The output send buffer: chunk p holds rank p's tokens.
+    out = torch.empty(seq_len, batch, heads, head_dim, dtype=dtype, device=query.device)
+    call = AttnCall(ulysses_world_size=plan.world_size, attention_kwargs=kwargs, seq_major_out=out.transpose(0, 1))
+    plan.spec.run(query, key, value, call)
+    if fp8_comms is not None:
+        out, _ = _per_tensor_quant(out, fp8_comms.o_scale)
+    received = _sdpa_all_to_all_single(out)
+    return received.view(plan.world_size, seq_len // plan.world_size, batch, heads, head_dim)
 
 
 def _combined_gqa_qkv_all_to_all(q, k, v, *extra):

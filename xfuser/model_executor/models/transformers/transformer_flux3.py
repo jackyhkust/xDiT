@@ -16,17 +16,13 @@ from diffusers.models.transformers.transformer_flux3 import (
 
 from xfuser import envs
 from xfuser.core.attention.numerics import hadamard
-from xfuser.core.attention.spec import AttentionBackendType
 from xfuser.core.distributed import (
-    get_ring_parallel_world_size,
     get_runtime_state,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
-    get_ulysses_parallel_world_size,
 )
 from xfuser.core.distributed.fp8_comms import (
     _FP8_DTYPE as FP8_COMMS_DTYPE,
-    Fp8CommsCall,
     register_fp8_comms_eligible_modules,
 )
 from xfuser.model_executor.layers import fused_block_ops, mxfp4_fused_quant, usp_sdma
@@ -35,10 +31,11 @@ from xfuser.model_executor.layers.usp import (
     PROCESS_GROUP,
     USP,
     attention,
+    SeqMajorPlan,
     seq_major_attention_output,
-    ulysses_aiter_attention,
-    ulysses_aiter_attention_from_send,
-    ulysses_aiter_fp8_attention_from_send,
+    usp_seq_major,
+    usp_seq_major_plan,
+    usp_seq_major_send,
 )
 from xfuser.model_executor.models.transformers.transformers_utils import (
     chunk_and_pad_sequence,
@@ -114,38 +111,18 @@ class xFuserFlux3AttnProcessor:
     every rank holds the whole stream, so attention runs without collectives.
     """
 
-    # Ulysses-only AITER attention takes the sequence-major exchange (see ulysses_aiter_attention).
+    # Ulysses-only calls take USP's sequence-major exchange where it applies (see usp_seq_major_plan).
     seq_major_ulysses = _env_flag("XFUSER_FLUX3_SEQ_MAJOR_ULYSSES")
 
     def __init__(self):
         self.valid_kv_len: Optional[int] = None
         self.local = False
 
-    def _seq_major_ulysses(self, attn: Flux3Attention) -> Optional[str]:
-        """``"bf16"`` or ``"fp8"`` when this call takes the sequence-major exchange, else None.
-
-        ``"fp8"`` is AITER's FP8 attention with FP8 Ulysses comms once this layer's scales
-        are calibrated; the calibration pass itself runs through USP, which measures them.
-        Under ``--ulysses_a2a sdma`` or ``packed`` the exchange is USP's (``usp_sdma``).
-        """
-        if self.local or not self.seq_major_ulysses or usp_sdma.selected():
+    def _seq_major_plan(self, attn: Flux3Attention) -> Optional[SeqMajorPlan]:
+        """USP's plan when this call takes the sequence-major exchange, else None."""
+        if self.local or not self.seq_major_ulysses:
             return None
-        ulysses_degree = get_ulysses_parallel_world_size()
-        if ulysses_degree <= 1 or get_ring_parallel_world_size() > 1 or attn.heads % ulysses_degree:
-            return None
-        state = get_runtime_state()
-        if getattr(state, "_xdit_compile_capture_bypass_attention", False):
-            return None
-        if state.attention_backend == AttentionBackendType.AITER and state.fp8_comms is None:
-            return "bf16"
-        if state.attention_backend != AttentionBackendType.AITER_FP8 or state.fp8_comms is None:
-            return None
-        from xfuser.core.attention.backends.aiter_fp8.kernel import MHA_V4_AVAILABLE
-
-        if not MHA_V4_AVAILABLE or attn.head_dim != 128 or getattr(attn, "fp8_comms_owner", None) is None:
-            return None
-        model_state = state.fp8_comms.get_model_state(attn.fp8_comms_owner)
-        return "fp8" if model_state is not None and model_state.synced else None
+        return usp_seq_major_plan(attn, attn.heads)
 
     def __call__(
         self,
@@ -195,44 +172,14 @@ class xFuserFlux3AttnProcessor:
         of the sequence-major exchange (in FP8 with its descale for FP8 comms), or else
         ``[b, s, h * d]`` rows."""
         fused_args = _fused_qk_norm_rope_args(attn, query, key, value, image_rotary_emb)
-        seq_major = self._seq_major_ulysses(attn)
-        if seq_major == "fp8" and fused_args is not None:
-            send = torch.ops.xfuser.qk_norm_rope_seq_major_send_fp8(
-                query,
-                key,
-                value,
-                *fused_args,
-                attn.heads,
-                get_ulysses_parallel_world_size(),
-                hadamard.matrix(attn.head_dim, str(query.device)),
-                attn.fp8_q_scale,
-                attn.fp8_k_scale,
-                attn.fp8_v_scale,
-                FP8_COMMS_DTYPE,
-            )
-            scales = Fp8CommsCall(attn.fp8_q_scale, attn.fp8_k_scale, attn.fp8_v_scale, attn.fp8_o_scale)
-            received = ulysses_aiter_fp8_attention_from_send(send, scales, self.valid_kv_len)
-            return SeqMajorFp8Output(received, attn.fp8_o_scale)
-        if seq_major == "fp8":
-            seq_major = None
-        if fused_args is not None and seq_major:
-            send = torch.ops.xfuser.qk_norm_rope_seq_major_send(
-                query, key, value, *fused_args, attn.heads, get_ulysses_parallel_world_size()
-            )
-        elif fused_args is not None:
-            query, key = torch.ops.xfuser.qk_norm_rope(query, key, *fused_args, attn.heads).unbind(2)
-            value = value.unflatten(-1, (attn.heads, -1))
-        else:
-            query = query.unflatten(-1, (attn.heads, -1))
-            key = key.unflatten(-1, (attn.heads, -1))
-            value = value.unflatten(-1, (attn.heads, -1))
-            query, key, value = self._norm_rope(attn, query, key, value, image_rotary_emb)
+        attention_kwargs = None if self.valid_kv_len is None else {"valid_kv_len": self.valid_kv_len}
+        plan = self._seq_major_plan(attn)
+        if plan is not None:
+            send = self._seq_major_send(attn, plan, query, key, value, image_rotary_emb, fused_args)
+            received = usp_seq_major(send, plan, attention_kwargs)
+            return received if plan.fp8_comms is None else SeqMajorFp8Output(received, plan.fp8_comms.o_scale)
 
-        if seq_major:
-            if fused_args is not None:
-                return ulysses_aiter_attention_from_send(send, self.valid_kv_len)
-            return ulysses_aiter_attention(query, key, value, self.valid_kv_len)
-
+        query, key, value = self._qk_norm_rope(attn, query, key, value, image_rotary_emb, fused_args)
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
@@ -240,13 +187,45 @@ class xFuserFlux3AttnProcessor:
         if self.local:
             hidden_states = attention(query, key, value)
         else:
-            attention_kwargs = None if self.valid_kv_len is None else {"valid_kv_len": self.valid_kv_len}
             hidden_states = USP(
                 query, key, value, attn_layer=attn, attention_kwargs=attention_kwargs, combine_qkv_a2a=True
             )
 
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         return hidden_states.to(query.dtype)
+
+    def _qk_norm_rope(self, attn, query, key, value, image_rotary_emb, fused_args):
+        """``[b, s, heads, d]`` q, k, v from ``[b, s, h * d]`` projections, q and k normed and rotated."""
+        if fused_args is not None:
+            query, key = torch.ops.xfuser.qk_norm_rope(query, key, *fused_args, attn.heads).unbind(2)
+            return query, key, value.unflatten(-1, (attn.heads, -1))
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+        return self._norm_rope(attn, query, key, value, image_rotary_emb)
+
+    def _seq_major_send(self, attn, plan, query, key, value, image_rotary_emb, fused_args):
+        """``usp_seq_major``'s send buffer, written by the q/k norm + RoPE kernel where it can."""
+        if fused_args is not None and plan.fp8_comms is None:
+            return torch.ops.xfuser.qk_norm_rope_seq_major_send(
+                query, key, value, *fused_args, attn.heads, plan.world_size
+            )
+        # The FP8 kernel rotates by one head_dim x head_dim matrix, which is rotate_qk's at 128.
+        if fused_args is not None and plan.spec.prequant_rotate is hadamard.rotate_qk and attn.head_dim == 128:
+            return torch.ops.xfuser.qk_norm_rope_seq_major_send_fp8(
+                query,
+                key,
+                value,
+                *fused_args,
+                attn.heads,
+                plan.world_size,
+                hadamard.matrix(attn.head_dim, str(query.device)),
+                plan.fp8_comms.q_scale,
+                plan.fp8_comms.k_scale,
+                plan.fp8_comms.v_scale,
+                FP8_COMMS_DTYPE,
+            )
+        return usp_seq_major_send(*self._qk_norm_rope(attn, query, key, value, image_rotary_emb, fused_args), plan)
 
     @staticmethod
     def _norm_rope(attn, query, key, value, image_rotary_emb):

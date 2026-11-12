@@ -177,71 +177,18 @@ def test_step_constants_recompute_for_a_new_or_modified_source():
         assert wrapper._step_constant("ids", inference_ids, compute) is first and len(calls) == 6
 
 
-def _seq_major_processor(monkeypatch, settings, change):
-    from xfuser.core.attention.spec import AttentionBackendType
-
-    state = SimpleNamespace(
-        attention_backend=AttentionBackendType[settings["backend"]],
-        fp8_comms=settings["fp8_comms"],
-        _xdit_compile_capture_bypass_attention=change.get("capture_bypass", False),
+@pytest.mark.parametrize(("change", "asks"), [({}, True), ({"local": True}, False), ({"disabled": True}, False)])
+def test_the_processor_takes_usps_seq_major_plan_unless_local_or_switched_off(monkeypatch, change, asks):
+    plan = object()
+    calls = []
+    monkeypatch.setattr(
+        transformer_flux3, "usp_seq_major_plan", lambda attn, heads: calls.append((attn, heads)) or plan
     )
-    monkeypatch.setattr(transformer_flux3, "get_runtime_state", lambda: state)
-    monkeypatch.setattr(transformer_flux3, "get_ulysses_parallel_world_size", lambda: settings["ulysses"])
-    monkeypatch.setattr(transformer_flux3, "get_ring_parallel_world_size", lambda: settings["ring"])
-    monkeypatch.setattr(transformer_flux3.usp_sdma, "selected", lambda: change.get("sdma", False))
     processor = transformer_flux3.xFuserFlux3AttnProcessor()
     processor.local = change.get("local", False)
     if change.get("disabled"):
         processor.seq_major_ulysses = False
-    return processor
+    attn = SimpleNamespace(heads=8)
 
-
-@pytest.mark.parametrize(
-    ("change", "expected"),
-    [
-        ({}, "bf16"),
-        ({"local": True}, None),
-        ({"ulysses": 1}, None),
-        ({"ring": 2}, None),
-        ({"heads": 6}, None),  # not divisible by the Ulysses degree
-        ({"backend": "AITER_FP8"}, None),  # FP8 attention without FP8 comms
-        ({"fp8_comms": object()}, None),  # FP8 comms with bf16 attention
-        ({"capture_bypass": True}, None),
-        ({"disabled": True}, None),
-        ({"sdma": True}, None),  # --ulysses_a2a sdma or packed: USP's exchange
-    ],
-)
-def test_only_plain_ulysses_aiter_attention_takes_the_seq_major_exchange(monkeypatch, change, expected):
-    settings = {"ulysses": 4, "ring": 1, "heads": 8, "backend": "AITER", "fp8_comms": None} | change
-    processor = _seq_major_processor(monkeypatch, settings, change)
-
-    assert processor._seq_major_ulysses(SimpleNamespace(heads=settings["heads"])) == expected
-
-
-@pytest.mark.parametrize(
-    ("change", "expected"),
-    [
-        ({}, "fp8"),
-        ({"synced": False}, None),  # calibration runs through USP
-        ({"owner": False}, None),  # not an FP8 comms layer
-        ({"head_dim": 64}, None),
-        ({"mha_v4": False}, None),
-        ({"ring": 2}, None),
-        ({"local": True}, None),
-        ({"disabled": True}, None),
-        ({"sdma": True}, None),  # --ulysses_a2a sdma or packed: USP's exchange
-    ],
-)
-def test_calibrated_fp8_comms_take_the_fp8_seq_major_exchange(monkeypatch, change, expected):
-    kernel = pytest.importorskip("xfuser.core.attention.backends.aiter_fp8.kernel")
-    monkeypatch.setattr(kernel, "MHA_V4_AVAILABLE", change.get("mha_v4", True))
-    owner = object()
-    model_state = SimpleNamespace(synced=change.get("synced", True))
-    fp8_comms = SimpleNamespace(get_model_state=lambda model: model_state if model is owner else None)
-    settings = {"ulysses": 4, "ring": 1, "heads": 8, "backend": "AITER_FP8", "fp8_comms": fp8_comms} | change
-    processor = _seq_major_processor(monkeypatch, settings, change)
-    attn = SimpleNamespace(heads=8, head_dim=change.get("head_dim", 128))
-    if change.get("owner", True):
-        attn.fp8_comms_owner = owner
-
-    assert processor._seq_major_ulysses(attn) == expected
+    assert processor._seq_major_plan(attn) is (plan if asks else None)
+    assert calls == ([(attn, 8)] if asks else [])
