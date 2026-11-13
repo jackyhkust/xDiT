@@ -42,7 +42,9 @@ BLOCK_THREADS = 256
 
 
 if _HAS_FLYDSL:
-
+    # TODO(aiter): upstream the differences listed above (dense rows with a runtime row stride,
+    # a column offset into wider rows, bf16 rounding before quantizing, the 1e-10 amax floor) as
+    # options of AITER's silu_and_mul_fq, and call that kernel once it lands.
     @lru_cache(maxsize=16)
     def _build_kernel(cols: int, out_cols: int, col_offset: int, scale_cols: int):
         """Launcher for ``[rows, 2 * cols]`` bf16 input rows into ``[rows, out_cols / 2]``

@@ -53,6 +53,10 @@ MAX_BLOCK_THREADS = 1024
 HADAMARD_BLOCK = 128
 
 
+# TODO(aiter): have AITER export mxfp4_scale_cols, mxfp4_pack and mxfp4_scale_offset, and use
+# its versions once they land. They re-derive the scale padding, E8M0/E2M1 packing and shuffled
+# scale layout of get_hip_quant(per_1x32)(..., shuffle=True), so a layout change in AITER
+# diverges from xDiT silently wherever the AMD accelerator suite does not run.
 def mxfp4_scale_cols(cols: int) -> int:
     """Columns of the shuffled E8M0 scales of ``cols``-column rows, as the HIP quantization pads them."""
     return (cols // 32 + 7) // 8 * 8
@@ -345,6 +349,9 @@ if _HAS_FLYDSL:
 
         return launch
 
+    # TODO(aiter): upstream the quantizing variant as a LayerNorm / adaLN counterpart of AITER's
+    # fused_rms_mxfp4_quant (optional gated residual, then (1 + scale) * layer_norm(x) + shift, to
+    # MXFP4 with shuffled scales), and launch the AITER kernel once it lands.
     @lru_cache(maxsize=32)
     def _build_row_kernel(cols: int, residual: bool, two_branches: bool, quantize: bool, eps: float):
         n_iters = cols // ROW_COLS
