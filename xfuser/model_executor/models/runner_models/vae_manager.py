@@ -4,6 +4,8 @@ import functools
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from distvae.vae import ParallelContext, VAERowSplitError, latent_rows, mark
 from distvae.vae import parallel as vae_parallel
 from distvae.vae import tile_parallel as vae_tile_parallel
@@ -20,9 +22,7 @@ from xfuser.core.utils.runner_utils import (
 from xfuser.envs import restore_torch_group_norm_for_distvae
 
 
-def _validate_vae_tile_pair(
-    config, capabilities, settings, kind, minimum, constraint
-) -> None:
+def _validate_vae_tile_pair(config, capabilities, settings, kind, minimum, constraint) -> None:
     names = tuple(f"vae_tile_{kind}_{axis}" for axis in ("height", "width"))
     flags = tuple(f"--{name}" for name in names)
     values = tuple(getattr(config, name, None) for name in names)
@@ -40,9 +40,113 @@ def _validate_vae_tile_pair(
         raise ValueError(f"{joined_flags} require --enable_tiling.")
     if not capabilities.enable_tiling:
         raise ValueError(
-            f"{joined_flags} configure tiled VAE decoding, "
-            f"which model {settings.model_name} does not support."
+            f"{joined_flags} configure tiled VAE decoding, which model {settings.model_name} does not support."
         )
+
+
+def attention_rows(attn, hidden_states: torch.Tensor, start: int, length: int) -> torch.Tensor:
+    """``attn(hidden_states).narrow(2, start, length)`` for a diffusers self-attention with
+    ``AttnProcessor2_0``, computing only the queries of those rows.
+
+    The group norm, keys and values still need every row; the attention, the query and the
+    output projection, which grow with the number of queries, run on ``length`` rows only.
+    """
+    batch_size, channel, height, width = hidden_states.shape
+    residual = hidden_states.narrow(2, start, length)
+    tokens = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+    if attn.group_norm is not None:
+        tokens = attn.group_norm(tokens.transpose(1, 2)).transpose(1, 2)
+
+    query = attn.to_q(tokens[:, start * width : (start + length) * width])
+    key = attn.to_k(tokens)
+    value = attn.to_v(tokens)
+    head_dim = key.shape[-1] // attn.heads
+    query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+    key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+    value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+    if attn.norm_k is not None:
+        key = attn.norm_k(key)
+
+    out = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+    out = out.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim).to(query.dtype)
+    out = attn.to_out[1](attn.to_out[0](out))
+    out = out.transpose(-1, -2).reshape(batch_size, channel, length, width)
+    if attn.residual_connection:
+        out = out + residual
+    return out / attn.rescale_output_factor
+
+
+class RowSplitAttnProcessor:
+    """``AttnProcessor2_0`` for a self-attention that every rank of the VAE group runs on the
+    whole image: each rank computes an equal band of query rows, and an all-gather rebuilds the
+    output. Calls it cannot split this way (cross-attention, masks, a height that does not
+    divide by the group size) run whole.
+    """
+
+    def __init__(self, parallel_context: ParallelContext):
+        from diffusers.models.attention_processor import AttnProcessor2_0
+
+        self.parallel_context = parallel_context
+        self.whole = AttnProcessor2_0()
+
+    def __call__(
+        self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs
+    ):
+        world_size = self.parallel_context.world_size
+        splittable = (
+            hidden_states.ndim == 4
+            and hidden_states.shape[2] % world_size == 0
+            and encoder_hidden_states is None
+            and attention_mask is None
+            and temb is None
+            and not args
+            and not kwargs
+        )
+        if not splittable:
+            return self.whole(attn, hidden_states, encoder_hidden_states, attention_mask, temb, *args, **kwargs)
+        rows = hidden_states.shape[2] // world_size
+        local = attention_rows(attn, hidden_states, self.parallel_context.rank * rows, rows).contiguous()
+        # Gloo requires the gather output concatenated along dim 0, not stacked.
+        bands = torch.empty((world_size * local.shape[0], *local.shape[1:]), dtype=local.dtype, device=local.device)
+        dist.all_gather_into_tensor(bands, local, group=self.parallel_context.group)
+        return bands.view(world_size, *local.shape).permute(1, 2, 0, 3, 4).reshape(hidden_states.shape)
+
+
+def _splittable_attention(attn) -> bool:
+    from diffusers.models.attention_processor import Attention, AttnProcessor2_0
+
+    return (
+        type(attn) is Attention
+        and type(attn.processor) is AttnProcessor2_0
+        and attn.spatial_norm is None
+        and not attn.is_cross_attention
+    )
+
+
+def split_replicated_vae_attention(vae) -> int:
+    """Split the mid-block attention that DistVAE's 2D decoder runs whole on every rank.
+
+    ``DecoderAdapter`` shards from the up blocks on; its mid block, attention included, decodes
+    the whole latent on every rank. At 2048² that is a 65k-token attention per rank.
+    """
+    from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
+
+    adapter = getattr(vae, "decoder", None)
+    if not isinstance(adapter, DecoderAdapter) or adapter.parallel_context.world_size == 1:
+        return 0
+    mid_block = getattr(adapter.decoder, "mid_block", None)
+    resnets = getattr(mid_block, "resnets", None) or ()
+    # Adapted resnets would mean the mid block runs on this rank's rows only.
+    if any(not type(resnet).__module__.startswith("diffusers.") for resnet in resnets):
+        return 0
+    split = 0
+    for attn in getattr(mid_block, "attentions", None) or ():
+        if attn is not None and _splittable_attention(attn):
+            attn.set_processor(RowSplitAttnProcessor(adapter.parallel_context))
+            split += 1
+    return split
 
 
 def validate_vae_config(config, capabilities, settings) -> None:
@@ -54,12 +158,8 @@ def validate_vae_config(config, capabilities, settings) -> None:
                 "identify and shard the GroupNorm layers."
             )
 
-    _validate_vae_tile_pair(
-        config, capabilities, settings, "size", 1, "positive"
-    )
-    _validate_vae_tile_pair(
-        config, capabilities, settings, "overlap", 0, "non-negative"
-    )
+    _validate_vae_tile_pair(config, capabilities, settings, "size", 1, "positive")
+    _validate_vae_tile_pair(config, capabilities, settings, "overlap", 0, "non-negative")
 
 
 class VAEManager:
@@ -85,9 +185,7 @@ class VAEManager:
         tiling_flag = self._tiling_flag()
         for vae in vaes:
             if self.config.enable_slicing:
-                vae_tiling.require_vae_support(
-                    vae, "slicing", "--enable_slicing"
-                )
+                vae_tiling.require_vae_support(vae, "slicing", "--enable_slicing")
                 log(f"Enabling VAE slicing on {type(vae).__name__}...")
                 vae.enable_slicing()
 
@@ -135,8 +233,7 @@ class VAEManager:
             global_ranks=tuple(coordinator.ranks),
         )
         log(
-            f"VAE parallel group: world_size={coordinator.world_size}, "
-            f"rank={coordinator.rank_in_group}",
+            f"VAE parallel group: world_size={coordinator.world_size}, rank={coordinator.rank_in_group}",
             debug=True,
         )
         try:
@@ -145,9 +242,7 @@ class VAEManager:
             AutoencoderKLMiniMaxH3 = None
 
         for vae in vaes:
-            if AutoencoderKLMiniMaxH3 is not None and isinstance(
-                vae, AutoencoderKLMiniMaxH3
-            ):
+            if AutoencoderKLMiniMaxH3 is not None and isinstance(vae, AutoencoderKLMiniMaxH3):
                 from xfuser.model_executor.models.runner_models.minimax_h3 import (
                     install_minimax_h3_vae_tile_parallel,
                 )
@@ -162,14 +257,13 @@ class VAEManager:
                 )
             else:
                 adapter = vae_parallel.parallelize_decoder(vae, vae_group)
-                log(
-                    f"Parallel VAE decoder enabled on {type(vae).__name__} via {adapter}."
-                )
+                log(f"Parallel VAE decoder enabled on {type(vae).__name__} via {adapter}.")
+                split = split_replicated_vae_attention(vae) if self.capabilities.split_parallel_vae_attention else 0
+                if split:
+                    log(f"Parallel VAE decoder: {split} replicated mid-block attention(s) split by query rows.")
             if self.capabilities.use_parallel_vae_encoder:
                 adapter = vae_parallel.parallelize_encoder(vae, vae_group)
-                log(
-                    f"Parallel VAE encoder enabled on {type(vae).__name__} via {adapter}."
-                )
+                log(f"Parallel VAE encoder enabled on {type(vae).__name__} via {adapter}.")
 
     def convert_to_channels_last(self, vaes) -> None:
         """Convert every supplied decoding VAE to channels-last exactly once."""
@@ -182,11 +276,7 @@ class VAEManager:
         convert_model_convs_to_channels_last(vae)
 
         original_decode = vae.decode
-        memory_format = (
-            torch.channels_last
-            if self.settings.model_output_type == "image"
-            else torch.channels_last_3d
-        )
+        memory_format = torch.channels_last if self.settings.model_output_type == "image" else torch.channels_last_3d
 
         @functools.wraps(original_decode)
         def decode_wrapper(*args, **kwargs):
@@ -224,11 +314,7 @@ class VAEManager:
         plan = vae_tiling.tile_shape_plan(vae, height, width)
         if plan is None:
             native = vae_tiling.tile_shape(vae)
-            native_shown = (
-                f" The VAE's default tile shape is {native[0]}x{native[1]}."
-                if native is not None
-                else ""
-            )
+            native_shown = f" The VAE's default tile shape is {native[0]}x{native[1]}." if native is not None else ""
             raise ValueError(
                 f"--vae_tile_size_height {height} with --vae_tile_size_width {width} "
                 f"is not a shape this VAE ({type(vae).__name__}) can tile exactly."
@@ -236,15 +322,10 @@ class VAEManager:
                 "scale and tile stride."
             )
         vae_tiling.apply_tile_plan(vae, plan)
-        log(
-            f"VAE tile window set to {height}x{width}px "
-            f"({', '.join(f'{a}={v}' for a, v in sorted(plan.items()))})"
-        )
+        log(f"VAE tile window set to {height}x{width}px ({', '.join(f'{a}={v}' for a, v in sorted(plan.items()))})")
         return shape
 
-    def _apply_vae_tile_overlap(
-        self, vae, sample_shape: Tuple[int, int]
-    ) -> None:
+    def _apply_vae_tile_overlap(self, vae, sample_shape: Tuple[int, int]) -> None:
         """Apply exact per-axis output-pixel tile overlap when requested."""
         requested = self._requested_vae_tile_overlap()
         if requested is None:
@@ -258,11 +339,7 @@ class VAEManager:
         )
         if plan is None:
             shape = vae_tiling.tile_shape(vae)
-            shape_shown = (
-                f"{shape[0]}x{shape[1]} pixels"
-                if shape is not None
-                else "an unknown pixel shape"
-            )
+            shape_shown = f"{shape[0]}x{shape[1]} pixels" if shape is not None else "an unknown pixel shape"
             raise ValueError(
                 f"The requested VAE tile overlap of {overlap_height}x{overlap_width} pixels "
                 f"is not exact for this VAE ({type(vae).__name__}) at its current tile shape "
@@ -271,23 +348,12 @@ class VAEManager:
             )
         vae_tiling.apply_tile_plan(vae, plan)
         landed = vae_tiling.tile_overlap(vae)
-        shown = (
-            f"{landed[0]}x{landed[1]}px"
-            if landed is not None
-            else f"{overlap_height}x{overlap_width}px"
-        )
-        log(
-            f"VAE tile overlap set to {shown} "
-            f"({', '.join(f'{a}={v:g}' for a, v in sorted(plan.items()))})"
-        )
+        shown = f"{landed[0]}x{landed[1]}px" if landed is not None else f"{overlap_height}x{overlap_width}px"
+        log(f"VAE tile overlap set to {shown} ({', '.join(f'{a}={v:g}' for a, v in sorted(plan.items()))})")
 
-    def _check_tiles_against_parallel_vae(
-        self, vae, native_shape: Optional[Tuple[int, int]]
-    ) -> None:
+    def _check_tiles_against_parallel_vae(self, vae, native_shape: Optional[Tuple[int, int]]) -> None:
         """Refuse a tile holding fewer latent rows than row-sharding ranks."""
-        if not (
-            self.config.use_parallel_vae and self.capabilities.use_parallel_vae
-        ):
+        if not (self.config.use_parallel_vae and self.capabilities.use_parallel_vae):
             return
         if vae_tile_parallel.context_of(vae) is not None:
             return
@@ -296,17 +362,9 @@ class VAEManager:
         if ranks < 2 or rows is None or rows >= ranks:
             return
         shape = vae_tiling.tile_shape(vae)
-        smallest = self._minimum_vae_tile_shape(
-            vae, shape, native_shape, ranks
-        )
-        shown = (
-            f"{shape[0]}x{shape[1]}px" if shape is not None else "unknown-size"
-        )
-        native_shown = (
-            f"{native_shape[0]}x{native_shape[1]}px"
-            if native_shape is not None
-            else "unknown"
-        )
+        smallest = self._minimum_vae_tile_shape(vae, shape, native_shape, ranks)
+        shown = f"{shape[0]}x{shape[1]}px" if shape is not None else "unknown-size"
+        native_shown = f"{native_shape[0]}x{native_shape[1]}px" if native_shape is not None else "unknown"
         raise ValueError(
             f"A {shown} VAE tile contains {rows} latent rows, but --use_parallel_vae uses "
             f"{ranks} ranks and requires at least one latent row per rank"
@@ -348,10 +406,7 @@ class VAEManager:
         """Install local or group-dispatched tiled decode when DistVAE provides one."""
         context = vae_tile_parallel.context_of(vae)
         if context is None:
-            if (
-                self._requested_vae_tile_shape() is None
-                and self._requested_vae_tile_overlap() is None
-            ):
+            if self._requested_vae_tile_shape() is None and self._requested_vae_tile_overlap() is None:
                 return
             installed = vae_tiling.tiled_decode_for(vae)
         else:
@@ -361,10 +416,7 @@ class VAEManager:
             return
         vae.tiled_decode = installed
         if context is None:
-            log(
-                f"VAE tiled decode on {type(vae).__name__}: using DistVAE's local "
-                "overlap loop."
-            )
+            log(f"VAE tiled decode on {type(vae).__name__}: using DistVAE's local overlap loop.")
             return
         log(
             f"VAE tiled decode on {type(vae).__name__}: assigning contiguous groups of "
@@ -372,9 +424,7 @@ class VAEManager:
             "outputs."
         )
 
-    def _install_vae_decode_guard(
-        self, vae, tile_shape: Optional[Tuple[int, int]] = None
-    ) -> None:
+    def _install_vae_decode_guard(self, vae, tile_shape: Optional[Tuple[int, int]] = None) -> None:
         """Add actionable OOM and narrow-tile diagnostics to a VAE decode."""
         vae._xfuser_guarded_tile_shape = tile_shape
         if getattr(vae, "_xfuser_decode_guarded", False):
@@ -388,9 +438,7 @@ class VAEManager:
             except VAERowSplitError as e:
                 raise ValueError(self._vae_row_split_hint(vae, e)) from e
             except torch.cuda.OutOfMemoryError as e:
-                raise torch.cuda.OutOfMemoryError(
-                    f"{self._vae_decode_oom_hint(vae)}\n{e}"
-                ) from e
+                raise torch.cuda.OutOfMemoryError(f"{self._vae_decode_oom_hint(vae)}\n{e}") from e
             except RuntimeError as e:
                 shape = getattr(vae, "_xfuser_guarded_tile_shape", None)
                 if shape is None or not vae_tiling.is_tile_padding_error(e):
@@ -421,9 +469,7 @@ class VAEManager:
             )
         ]
         if self.capabilities.enable_tiling and vae_tiling.supports_tile_parallel(vae):
-            actions.append(
-                "enable --enable_tiling to distribute complete tiles instead"
-            )
+            actions.append("enable --enable_tiling to distribute complete tiles instead")
         actions.append("disable --use_parallel_vae")
         return f"{message} {', '.join(actions[:-1])}, or {actions[-1]}."
 
@@ -431,13 +477,9 @@ class VAEManager:
         if not getattr(vae, "use_tiling", False):
             if self.capabilities.enable_tiling:
                 return (
-                    "VAE decode ran out of memory with tiling disabled. Re-run with "
-                    "--enable_tiling to decode in tiles."
+                    "VAE decode ran out of memory with tiling disabled. Re-run with --enable_tiling to decode in tiles."
                 )
-            return (
-                f"VAE decode ran out of memory, and model {self.settings.model_name} does not "
-                "support VAE tiling."
-            )
+            return f"VAE decode ran out of memory, and model {self.settings.model_name} does not support VAE tiling."
 
         shape = vae_tiling.tile_shape(vae)
         if shape is None:
