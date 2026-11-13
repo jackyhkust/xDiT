@@ -194,7 +194,7 @@ def _seq_major_worker(rank, world_size, init_method, ulysses_degree):
         device = _setup(rank, world_size, init_method, ulysses_degree, backend="AITER")
         # AITER's dense kernel takes bf16 and a head dimension of at least 64.
         wrapper = _wrapper_of(_tiny_model(device, head_dim=64), device).to(torch.bfloat16)
-        plan = wrapper._joint_processor._seq_major_plan(wrapper.single_transformer_blocks[0].attn)
+        plan = wrapper._joint_processor._seq_major_plan(wrapper.single_transformer_blocks[0].attn, None)
         assert plan is not None and plan.fp8_comms is None
 
         cases = itertools.product(LAYOUTS, (False, True), (True, False), (True, False))
@@ -257,7 +257,7 @@ def _seq_major_fp8_worker(rank, world_size, init_method, ulysses_degree):
             for offset, name in enumerate(("fp8_q_scale", "fp8_k_scale", "fp8_v_scale", "fp8_o_scale")):
                 getattr(attn, name).fill_(0.004 * (1 + 0.1 * index + 0.03 * offset))
         fp8_comms.get_model_state(wrapper).synced = True
-        plan = wrapper._joint_processor._seq_major_plan(wrapper.single_transformer_blocks[0].attn)
+        plan = wrapper._joint_processor._seq_major_plan(wrapper.single_transformer_blocks[0].attn, None)
         assert plan is not None and plan.fp8_comms is not None
 
         for layout, with_references, fused in itertools.product(LAYOUTS, (False, True), (True, False)):

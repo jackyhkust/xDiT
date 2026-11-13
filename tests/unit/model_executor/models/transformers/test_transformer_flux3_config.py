@@ -182,13 +182,16 @@ def test_the_processor_takes_usps_seq_major_plan_unless_local_or_switched_off(mo
     plan = object()
     calls = []
     monkeypatch.setattr(
-        transformer_flux3, "usp_seq_major_plan", lambda attn, heads: calls.append((attn, heads)) or plan
+        transformer_flux3,
+        "usp_seq_major_plan",
+        lambda attn, heads, attention_kwargs: calls.append((attn, heads, attention_kwargs)) or plan,
     )
     processor = transformer_flux3.xFuserFlux3AttnProcessor()
     processor.local = change.get("local", False)
     if change.get("disabled"):
         processor.seq_major_ulysses = False
     attn = SimpleNamespace(heads=8)
+    attention_kwargs = {"valid_kv_len": 5}
 
-    assert processor._seq_major_plan(attn) is (plan if asks else None)
-    assert calls == ([(attn, 8)] if asks else [])
+    assert processor._seq_major_plan(attn, attention_kwargs) is (plan if asks else None)
+    assert calls == ([(attn, 8, attention_kwargs)] if asks else [])

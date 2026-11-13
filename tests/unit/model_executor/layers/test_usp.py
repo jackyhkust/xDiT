@@ -152,7 +152,9 @@ def _seq_major_plan(monkeypatch, change):
     monkeypatch.setattr(usp, "_compile_capture_bypasses_attention", lambda: settings.get("capture_bypass", False))
     monkeypatch.setattr(usp.usp_sdma, "selected", lambda: settings.get("sdma", False))
     monkeypatch.setattr(usp, "_has_kv_cache", lambda layer: settings.get("kv_cache", False))
-    return usp.usp_seq_major_plan(settings.get("attn", SimpleNamespace()), settings["heads"])
+    return usp.usp_seq_major_plan(
+        settings.get("attn", SimpleNamespace()), settings["heads"], settings.get("attention_kwargs")
+    )
 
 
 @pytest.mark.parametrize(
@@ -165,6 +167,10 @@ def _seq_major_plan(monkeypatch, change):
         {"capture_bypass": True},
         {"sdma": True},  # --ulysses_a2a sdma or packed: USP's exchange
         {"kv_cache": True},
+        # The exchange carries no extra Ulysses inputs and builds no VarlenPacking.
+        {"attention_kwargs": {usp.ULYSSES_EXTRA_INPUTS_KEY: ("gate",), "gate": torch.ones(1)}},
+        {"attention_kwargs": {"attn_mask": torch.ones(1, dtype=torch.bool)}},
+        {"attention_kwargs": {"valid_kv_len": 5, "cu_seqlens_k": torch.zeros(2, dtype=torch.int32)}},
     ],
 )
 def test_calls_the_seq_major_exchange_does_not_serve_take_usp(monkeypatch, change):
@@ -176,7 +182,13 @@ def test_ulysses_calls_on_a_strided_bshd_backend_take_the_seq_major_exchange(mon
     plan = _seq_major_plan(monkeypatch, {"backend": backend})
 
     assert plan.spec.type is AttentionBackendType[backend]
-    assert plan.world_size == 4 and plan.fp8_comms is None
+    assert plan.world_size == 4 and plan.fp8_comms is None and plan.attention_kwargs == {}
+
+
+def test_the_plan_keeps_valid_kv_len_and_ignores_unset_attention_kwargs(monkeypatch):
+    plan = _seq_major_plan(monkeypatch, {"attention_kwargs": {"valid_kv_len": 5, "attn_mask": None}})
+
+    assert plan.attention_kwargs == {"valid_kv_len": 5}
 
 
 @pytest.mark.parametrize(
@@ -223,18 +235,32 @@ def test_usp_seq_major_runs_the_plans_spec_on_the_received_views(monkeypatch):
     )
     monkeypatch.setattr(usp, "_sdpa_all_to_all_single", lambda tensor: tensor)
     query, key, value = (torch.randn(2, 6, 4, 8) for _ in range(3))
-    plan = usp.SeqMajorPlan(spec, 1, None)
+    plan = usp.SeqMajorPlan(spec, 1, None, {"valid_kv_len": 5})
     send = usp.usp_seq_major_send(query, key, value, plan)
 
-    received = usp.usp_seq_major(send, plan, {"valid_kv_len": 5})
+    output = usp.usp_seq_major(send, plan)
 
     expected = torch.nn.functional.scaled_dot_product_attention(
         query.transpose(1, 2), key[:, :5].transpose(1, 2), value[:, :5].transpose(1, 2)
     )
-    torch.testing.assert_close(usp.seq_major_attention_output(received), expected.transpose(1, 2).flatten(2))
+    assert isinstance(output, usp.SeqMajorOutput) and output.descale is None
+    torch.testing.assert_close(output.rows(query.dtype), expected.transpose(1, 2).flatten(2))
     received_query, call = calls[0]
     assert received_query.untyped_storage().data_ptr() == send.untyped_storage().data_ptr()
     assert call.attention_kwargs["valid_kv_len"] == 5
+
+
+def test_seq_major_output_rows_dequantize_fp8_with_the_descale():
+    rows = torch.randn(2, 3, 2 * 4 * 8)
+    received = rows.view(2, 3, 2, 4, 8).permute(2, 1, 0, 3, 4)  # [P, s, b, h/P, d]
+    descale = torch.tensor([0.5])
+    fp8 = (received / descale).to(torch.float8_e4m3fn)
+
+    dequantized = usp.SeqMajorOutput(fp8, descale).rows(torch.bfloat16)
+
+    assert dequantized.dtype == torch.bfloat16
+    expected = usp.seq_major_attention_output(fp8).float() * descale
+    torch.testing.assert_close(dequantized, expected.to(torch.bfloat16), rtol=0, atol=0)
 
 
 def test_repeat_kv_heads_preserves_gqa_order():

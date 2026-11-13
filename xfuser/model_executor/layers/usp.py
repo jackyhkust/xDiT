@@ -225,6 +225,26 @@ def seq_major_attention_output(received):
     return received.permute(2, 1, 0, 3, 4).reshape(b, s, world_size * heads * d)
 
 
+class SeqMajorOutput(NamedTuple):
+    """``usp_seq_major``'s result: the output exchange's receive buffer ``[P, s, b, h/P, d]``,
+    whose chunk ``p`` holds heads ``p * h/P`` onwards for this rank's ``s`` tokens, and the
+    one-element descale of its values when they are FP8 (fp8 comms), else None.
+
+    A consumer may read ``received`` in place, dequantizing as ``rows`` does.
+    """
+
+    received: torch.Tensor
+    descale: Optional[torch.Tensor]
+
+    def rows(self, dtype: torch.dtype) -> torch.Tensor:
+        """The ``[b, s, h * d]`` rows in ``dtype``, with one copy; FP8 values dequantize as
+        ``fp8_comms_output_all_to_all`` dequantizes ``USP``'s output exchange."""
+        rows = seq_major_attention_output(self.received)
+        if self.descale is not None:
+            rows = rows.float() * self.descale
+        return rows.to(dtype)
+
+
 class SeqMajorPlan(NamedTuple):
     """How ``usp_seq_major`` runs one attention call; see ``usp_seq_major_plan``."""
 
@@ -232,21 +252,34 @@ class SeqMajorPlan(NamedTuple):
     world_size: int
     # The layer's calibrated fp8-comms scales when q, k, v and the output travel in FP8.
     fp8_comms: Optional[Fp8CommsCall]
+    # The call's attention_kwargs, limited to _SEQ_MAJOR_ATTENTION_KWARGS.
+    attention_kwargs: dict
 
 
-def usp_seq_major_plan(attn_layer, heads, backend=None) -> Optional[SeqMajorPlan]:
+# The attention_kwargs the sequence-major exchange honours. It builds no VarlenPacking and
+# carries no ULYSSES_EXTRA_INPUTS_KEY tensors, so a call with masks, varlen packing or extra
+# Ulysses inputs takes USP.
+_SEQ_MAJOR_ATTENTION_KWARGS = frozenset({"valid_kv_len"})
+
+
+def usp_seq_major_plan(attn_layer, heads, attention_kwargs=None, backend=None) -> Optional[SeqMajorPlan]:
     """The plan of a self-attention call that may take USP's sequence-major Ulysses exchange,
     or None when it takes ``USP``.
 
     The sequence-major exchange sends q, k and v as one ``[P, s, b, 3, h/P, d]`` buffer --
     destination rank, then sequence position -- so the received chunks join into strided BSHD
     views over the whole sequence, which the kernel reads without a copy, and the output
-    returns as ``[P, s, b, h/P, d]``. It serves Ulysses-only calls on a backend whose spec
-    ``reads_strided_bshd``, without what ``USP`` adds around its exchange (joint tensors, KV
-    caching, head balancing, SDMA, the compile-capture bypass). While ``attn_layer``'s model
+    returns as ``[P, s, b, h/P, d]``. It serves non-causal self-attention without dropout, in
+    Ulysses-only calls on a backend whose spec ``reads_strided_bshd``, without what ``USP``
+    adds around its exchange (joint tensors, KV caching, head balancing, SDMA, the
+    compile-capture bypass). Of ``attention_kwargs`` it honours ``valid_kv_len`` only; any
+    other entry that is not None makes the call take ``USP``. While ``attn_layer``'s model
     calibrates fp8 comms its calls take ``USP``, which observes them; once calibrated, a
     backend that ``accepts_prequantized`` exchanges FP8 q, k, v and output.
     """
+    attention_kwargs = {name: value for name, value in (attention_kwargs or {}).items() if value is not None}
+    if not attention_kwargs.keys() <= _SEQ_MAJOR_ATTENTION_KWARGS:
+        return None
     if _compile_capture_bypasses_attention() or usp_sdma.selected():
         return None
     world_size, ring_world_size = _parallel_degrees()
@@ -267,7 +300,7 @@ def usp_seq_major_plan(attn_layer, heads, backend=None) -> Optional[SeqMajorPlan
         fp8_comms = Fp8CommsCall(
             attn_layer.fp8_q_scale, attn_layer.fp8_k_scale, attn_layer.fp8_v_scale, attn_layer.fp8_o_scale
         )
-    return SeqMajorPlan(spec, world_size, fp8_comms)
+    return SeqMajorPlan(spec, world_size, fp8_comms, attention_kwargs)
 
 
 def _fp8_comms_model_state(fp8_comms, attn_layer):
@@ -293,23 +326,18 @@ def usp_seq_major_send(query, key, value, plan: SeqMajorPlan):
     return _per_tensor_quant(send, scales)[0]
 
 
-def usp_seq_major(send, plan: SeqMajorPlan, attention_kwargs=None):
+def usp_seq_major(send, plan: SeqMajorPlan) -> SeqMajorOutput:
     """Ulysses attention through the sequence-major exchange of ``send``, built by
     ``usp_seq_major_send`` or by a kernel writing the same layout and quantization.
 
-    Same result as ``USP`` with the plan's backend: the selected spec runs the call, through
-    its ``accepts``, on the received views. ``attention_kwargs["valid_kv_len"]`` drops a
-    uniform trailing K/V pad, as in ``USP``.
-
-    Returns the output exchange's receive buffer ``[P, s, b, h/P, d]``: chunk ``p`` holds
-    heads ``p * h/P`` onwards for this rank's ``s`` tokens, in FP8 under the plan's fp8 comms,
-    where it dequantizes as ``x.float() * plan.fp8_comms.o_scale``. ``seq_major_attention_output``
-    gives its ``[b, s, h * d]`` rows with one copy; a consumer may read it in place instead.
+    Same result as ``USP`` with the plan's backend and attention_kwargs: the selected spec runs
+    the call, through its ``accepts``, on the received views. ``valid_kv_len`` drops a uniform
+    trailing K/V pad, as in ``USP``.
     """
     fp8_comms = plan.fp8_comms
     received = _sdpa_all_to_all_single(send)
     query, key, value = (view.transpose(1, 2) for view in _seq_major_qkv_views(received))
-    kwargs = dict(attention_kwargs or {})
+    kwargs = dict(plan.attention_kwargs)
     if fp8_comms is not None:
         kwargs |= {
             "pre_quantized": True,
@@ -324,10 +352,11 @@ def usp_seq_major(send, plan: SeqMajorPlan, attention_kwargs=None):
     out = torch.empty(seq_len, batch, heads, head_dim, dtype=dtype, device=query.device)
     call = AttnCall(ulysses_world_size=plan.world_size, attention_kwargs=kwargs, seq_major_out=out.transpose(0, 1))
     plan.spec.run(query, key, value, call)
+    descale = None
     if fp8_comms is not None:
-        out, _ = _per_tensor_quant(out, fp8_comms.o_scale)
+        out, descale = _per_tensor_quant(out, fp8_comms.o_scale)
     received = _sdpa_all_to_all_single(out)
-    return received.view(plan.world_size, seq_len // plan.world_size, batch, heads, head_dim)
+    return SeqMajorOutput(received.view(plan.world_size, seq_len // plan.world_size, batch, heads, head_dim), descale)
 
 
 def _combined_gqa_qkv_all_to_all(q, k, v, *extra):

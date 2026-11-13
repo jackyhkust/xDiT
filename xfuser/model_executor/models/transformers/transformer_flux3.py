@@ -1,5 +1,5 @@
 import functools
-from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -31,8 +31,8 @@ from xfuser.model_executor.layers.usp import (
     PROCESS_GROUP,
     USP,
     attention,
+    SeqMajorOutput,
     SeqMajorPlan,
-    seq_major_attention_output,
     usp_seq_major,
     usp_seq_major_plan,
     usp_seq_major_send,
@@ -55,21 +55,6 @@ FUSED_MXFP4_QUANT = _env_flag("XFUSER_FLUX3_FUSED_MXFP4_QUANT")
 # block's gated residual runs in the next block's LayerNorm kernel (see fused_block_ops).
 FUSED_QK_NORM_ROPE = _env_flag("XFUSER_FLUX3_FUSED_QK_NORM_ROPE")
 FUSED_BLOCK_RESIDUAL = _env_flag("XFUSER_FLUX3_FUSED_BLOCK_RESIDUAL")
-
-
-class SeqMajorFp8Output(NamedTuple):
-    """The FP8 ``[P, s, b, h/P, d]`` output receive buffer of the FP8 sequence-major
-    exchange and its one-element descale."""
-
-    received: torch.Tensor
-    descale: torch.Tensor
-
-
-def _seq_major_rows(received: torch.Tensor, descale: Optional[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
-    """The ``[b, s, h * d]`` rows of an output receive buffer, an FP8 one dequantized as
-    ``fp8_comms`` dequantizes USP's output exchange."""
-    rows = seq_major_attention_output(received)
-    return rows if descale is None else (rows.float() * descale).to(dtype)
 
 
 def _takes_quantized_input(layer: torch.nn.Module) -> bool:
@@ -118,11 +103,11 @@ class xFuserFlux3AttnProcessor:
         self.valid_kv_len: Optional[int] = None
         self.local = False
 
-    def _seq_major_plan(self, attn: Flux3Attention) -> Optional[SeqMajorPlan]:
+    def _seq_major_plan(self, attn: Flux3Attention, attention_kwargs: Optional[dict]) -> Optional[SeqMajorPlan]:
         """USP's plan when this call takes the sequence-major exchange, else None."""
         if self.local or not self.seq_major_ulysses:
             return None
-        return usp_seq_major_plan(attn, attn.heads)
+        return usp_seq_major_plan(attn, attn.heads, attention_kwargs)
 
     def __call__(
         self,
@@ -146,18 +131,15 @@ class xFuserFlux3AttnProcessor:
     ) -> torch.Tensor:
         """Attention and output projection from already projected ``[b, s, h * d]`` q, k and v."""
         attention_output = self.attend_unprojected(attn, query, key, value, image_rotary_emb)
-        descale = None
-        if isinstance(attention_output, SeqMajorFp8Output):
-            attention_output, descale = attention_output
-        if attention_output.ndim == 5:
-            if _takes_quantized_input(attn.to_out[0]):
-                _, seq_len, batch, _, _ = attention_output.shape
-                quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(attention_output, descale)
-                hidden_states = attn.to_out[0].forward_quantized(*quantized, (batch, seq_len))
-            else:
-                hidden_states = attn.to_out[0](_seq_major_rows(attention_output, descale, query.dtype))
-        else:
+        if not isinstance(attention_output, SeqMajorOutput):
             hidden_states = attn.to_out[0](attention_output)
+        elif _takes_quantized_input(attn.to_out[0]):
+            received, descale = attention_output
+            _, seq_len, batch, _, _ = received.shape
+            quantized = torch.ops.xfuser.seq_major_attention_output_mxfp4_quant(received, descale)
+            hidden_states = attn.to_out[0].forward_quantized(*quantized, (batch, seq_len))
+        else:
+            hidden_states = attn.to_out[0](attention_output.rows(query.dtype))
         return attn.to_out[1](hidden_states)
 
     def attend_unprojected(
@@ -167,17 +149,15 @@ class xFuserFlux3AttnProcessor:
         key: torch.Tensor,
         value: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Union[torch.Tensor, "SeqMajorFp8Output"]:
-        """``attend`` before the output projection: the ``[P, s, b, h/P, d]`` receive buffer
-        of the sequence-major exchange (in FP8 with its descale for FP8 comms), or else
-        ``[b, s, h * d]`` rows."""
+    ) -> Union[torch.Tensor, SeqMajorOutput]:
+        """``attend`` before the output projection: the sequence-major exchange's
+        ``SeqMajorOutput``, or else ``[b, s, h * d]`` rows."""
         fused_args = _fused_qk_norm_rope_args(attn, query, key, value, image_rotary_emb)
         attention_kwargs = None if self.valid_kv_len is None else {"valid_kv_len": self.valid_kv_len}
-        plan = self._seq_major_plan(attn)
+        plan = self._seq_major_plan(attn, attention_kwargs)
         if plan is not None:
             send = self._seq_major_send(attn, plan, query, key, value, image_rotary_emb, fused_args)
-            received = usp_seq_major(send, plan, attention_kwargs)
-            return received if plan.fp8_comms is None else SeqMajorFp8Output(received, plan.fp8_comms.o_scale)
+            return usp_seq_major(send, plan)
 
         query, key, value = self._qk_norm_rope(attn, query, key, value, image_rotary_emb, fused_args)
         query = query.transpose(1, 2)
@@ -300,17 +280,18 @@ def _block_branches(block, projected, image_rotary_emb) -> tuple:
         return attn_output, ff_output
 
     attention_output = processor.attend_unprojected(block.attn, query, key, value, image_rotary_emb)
-    descale = None
-    if isinstance(attention_output, SeqMajorFp8Output):
-        attention_output, descale = attention_output
+    seq_major = isinstance(attention_output, SeqMajorOutput)
     if _takes_quantized_input(block.fused_out):
-        if attention_output.ndim == 3:
+        if seq_major:
+            received, descale = attention_output
+        else:
             # [b, s, h * d] rows as a one-rank receive buffer [1, s, b, h, d].
-            attention_output = attention_output.unflatten(-1, (block.attn.heads, -1)).unsqueeze(0).transpose(1, 2)
-        quantized = torch.ops.xfuser.attention_output_swiglu_mxfp4_quant(attention_output, ff_hidden, descale)
+            received = attention_output.unflatten(-1, (block.attn.heads, -1)).unsqueeze(0).transpose(1, 2)
+            descale = None
+        quantized = torch.ops.xfuser.attention_output_swiglu_mxfp4_quant(received, ff_hidden, descale)
         return (block.fused_out.forward_quantized(*quantized, ff_hidden.shape[:-1]),)
-    if attention_output.ndim == 5:
-        attention_output = _seq_major_rows(attention_output, descale, ff_hidden.dtype)
+    if seq_major:
+        attention_output = attention_output.rows(ff_hidden.dtype)
     return (block.fused_out(torch.cat([attention_output, block.ff.act_fn(ff_hidden)], dim=-1)),)
 
 
